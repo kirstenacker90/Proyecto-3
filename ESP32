@@ -1,0 +1,962 @@
+// Universidad del Valle de Guatemala
+// Electrónica digital 2
+//Proyecto 3
+// Kirsten Ackerman - 23853
+// Christian Girón- 23233
+
+
+#include <Arduino.h>
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+
+/* ============================================================
+ * CONFIGURACION UART
+ * ============================================================ */
+
+#define ESP32_RX_NUCLEO 16
+#define ESP32_TX_NUCLEO 17
+
+#define VELOCIDAD_UART 115200
+
+/* ============================================================
+ * CONFIGURACION BLE
+ * ============================================================ */
+
+#define UUID_SERVICIO \
+    "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+
+#define UUID_RX \
+    "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+
+#define UUID_TX \
+    "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+static const char *NOMBRE_BLE =
+    "Proyecto03_ESP32";
+
+/* ============================================================
+ * LIMITES
+ * ============================================================ */
+
+#define TAM_COMANDO        31U
+#define TAM_RESPUESTA     119U
+#define TAM_COLA            8U
+
+#define TAM_NOTIFICACION   20U
+
+/* ============================================================
+ * TIPOS DE COMANDOS
+ * ============================================================ */
+
+enum TipoComando : uint8_t
+{
+    COMANDO_INVALIDO,
+    COMANDO_LECTURA,
+    COMANDO_GUARDADO
+};
+
+/* ============================================================
+ * ESTRUCTURA DE COMANDOS
+ * ============================================================ */
+
+struct MensajeComando
+{
+    TipoComando tipo;
+    bool desdeBLE;
+};
+
+/* ============================================================
+ * VARIABLES BLE
+ * ============================================================ */
+
+static BLECharacteristic *caracteristicaTX = nullptr;
+
+static QueueHandle_t colaComandos = nullptr;
+
+static volatile bool conectado = false;
+
+static volatile bool reiniciarPublicidad = false;
+
+static volatile bool colaLlena = false;
+
+static bool conectadoAnterior = false;
+
+/* ============================================================
+ * VARIABLES UART USB
+ * ============================================================ */
+
+static String entradaUSB;
+
+static bool descartarUSB = false;
+
+/* ============================================================
+ * VARIABLES UART NUCLEO 1
+ * ============================================================ */
+
+static String entradaNucleo;
+
+static bool descartarNucleo = false;
+
+/* ============================================================
+ * PROTOTIPOS
+ * ============================================================ */
+
+static void EncolarComando(
+    String texto,
+    bool desdeBLE
+);
+
+static void NotificarBLE(
+    const char *texto
+);
+
+static void LeerUSB(void);
+
+static void ProcesarComandos(void);
+
+static void LeerNucleo(void);
+
+static void ProcesarLineaNucleo(
+    const String &linea
+);
+
+/* ============================================================
+ * ENCOLAR COMANDOS
+ * ============================================================ */
+
+static void EncolarComando(
+    String texto,
+    bool desdeBLE)
+{
+    texto.trim();
+
+    texto.toUpperCase();
+
+    if (texto.length() == 0)
+    {
+        return;
+    }
+
+    MensajeComando mensaje;
+
+    mensaje.desdeBLE = desdeBLE;
+
+    mensaje.tipo = COMANDO_INVALIDO;
+
+    /* ========================================================
+       COMANDO LECTURA
+       ======================================================== */
+
+    if (texto == "L" ||
+        texto == "LEER" ||
+        texto == "LECTURA")
+    {
+        mensaje.tipo = COMANDO_LECTURA;
+    }
+
+    /* ========================================================
+       COMANDO GUARDADO
+       ======================================================== */
+
+    else if (texto == "G" ||
+             texto == "GUARDAR" ||
+             texto == "GUARDADO")
+    {
+        mensaje.tipo = COMANDO_GUARDADO;
+    }
+
+    /* ========================================================
+       AGREGAR A LA COLA
+       ======================================================== */
+
+    if (colaComandos == nullptr)
+    {
+        return;
+    }
+
+    if (xQueueSend(
+            colaComandos,
+            &mensaje,
+            0) != pdTRUE)
+    {
+        colaLlena = true;
+    }
+}
+
+/* ============================================================
+ * EVENTOS DEL SERVIDOR BLUETOOTH
+ * ============================================================ */
+
+class EventosServidor : public BLEServerCallbacks
+{
+    void onConnect(BLEServer *servidor) override
+    {
+        (void)servidor;
+
+        conectado = true;
+    }
+
+    void onDisconnect(BLEServer *servidor) override
+    {
+        (void)servidor;
+
+        conectado = false;
+
+        reiniciarPublicidad = true;
+    }
+};
+
+/* ============================================================
+ * EVENTOS DE RECEPCION BLUETOOTH
+ * ============================================================ */
+
+class EventosRecepcion : public BLECharacteristicCallbacks
+{
+    void onWrite(
+        BLECharacteristic *caracteristica) override
+    {
+        auto contenido =
+            caracteristica->getValue();
+
+        if (contenido.length() == 0)
+        {
+            return;
+        }
+
+        /* Evitar comandos demasiado largos */
+
+        if (contenido.length() > TAM_COMANDO)
+        {
+            EncolarComando(
+                "INVALIDO",
+                true
+            );
+
+            return;
+        }
+
+        String texto;
+
+        texto.reserve(
+            contenido.length() + 1U
+        );
+
+        /* Copiar caracteres recibidos */
+
+        for (size_t i = 0;
+             i < contenido.length();
+             i++)
+        {
+            texto += (char)contenido[i];
+        }
+
+        EncolarComando(
+            texto,
+            true
+        );
+    }
+};
+
+/* ============================================================
+ * ENVIAR NOTIFICACIONES BLUETOOTH
+ * ============================================================ */
+
+static void NotificarBLE(
+    const char *texto)
+{
+    if (!conectado ||
+        caracteristicaTX == nullptr ||
+        texto == nullptr)
+    {
+        return;
+    }
+
+    size_t longitud =
+        strlen(texto);
+
+    /*
+     * Se utilizan fragmentos de 20 bytes
+     * para mantener compatibilidad con
+     * el MTU BLE predeterminado.
+     */
+
+    for (size_t posicion = 0;
+         posicion < longitud && conectado;
+         posicion += TAM_NOTIFICACION)
+    {
+        size_t cantidad =
+            longitud - posicion;
+
+        if (cantidad > TAM_NOTIFICACION)
+        {
+            cantidad = TAM_NOTIFICACION;
+        }
+
+        caracteristicaTX->setValue(
+            (uint8_t *)(texto + posicion),
+            cantidad
+        );
+
+        caracteristicaTX->notify();
+
+        delay(10);
+    }
+}
+
+/* ============================================================
+ * LEER COMANDOS DESDE MONITOR SERIAL USB
+ * ============================================================ */
+
+static void LeerUSB(void)
+{
+    while (Serial.available() > 0)
+    {
+        int dato =
+            Serial.read();
+
+        if (dato < 0)
+        {
+            break;
+        }
+
+        /* ====================================================
+           FIN DE LINEA
+           ==================================================== */
+
+        if (dato == '\r' ||
+            dato == '\n')
+        {
+            if (descartarUSB)
+            {
+                descartarUSB = false;
+
+                entradaUSB = "";
+
+                Serial.println(
+                    "Comando demasiado largo."
+                );
+            }
+
+            else if (entradaUSB.length() > 0)
+            {
+                EncolarComando(
+                    entradaUSB,
+                    false
+                );
+
+                entradaUSB = "";
+            }
+
+            continue;
+        }
+
+        /* ====================================================
+           IGNORAR COMANDO DESCARTADO
+           ==================================================== */
+
+        if (descartarUSB)
+        {
+            continue;
+        }
+
+        /* ====================================================
+           BORRAR CARACTER
+           ==================================================== */
+
+        if (dato == '\b' ||
+            dato == 127)
+        {
+            if (entradaUSB.length() > 0)
+            {
+                entradaUSB.remove(
+                    entradaUSB.length() - 1
+                );
+            }
+
+            continue;
+        }
+
+        /* ====================================================
+           ALMACENAR CARACTER
+           ==================================================== */
+
+        if (dato >= 32 &&
+            dato <= 126)
+        {
+            if (entradaUSB.length() < TAM_COMANDO)
+            {
+                entradaUSB += (char)dato;
+            }
+            else
+            {
+                entradaUSB = "";
+
+                descartarUSB = true;
+            }
+        }
+    }
+}
+
+/* ============================================================
+ * PROCESAR COMANDOS
+ * ============================================================ */
+
+static void ProcesarComandos(void)
+{
+    MensajeComando mensaje;
+
+    while (xQueueReceive(
+               colaComandos,
+               &mensaje,
+               0) == pdTRUE)
+    {
+        const char *respuesta = nullptr;
+
+        /* ====================================================
+           COMANDO DE LECTURA
+           ==================================================== */
+
+        switch (mensaje.tipo)
+        {
+            case COMANDO_LECTURA:
+
+                Serial2.println(
+                    "LECTURA"
+                );
+
+                respuesta =
+                    "LECTURA enviada a Nucleo 1.\r\n";
+
+                break;
+
+            /* ================================================
+               COMANDO DE GUARDADO
+               ================================================ */
+
+            case COMANDO_GUARDADO:
+
+                Serial2.println(
+                    "GUARDADO"
+                );
+
+                respuesta =
+                    "GUARDADO enviado a Nucleo 1.\r\n";
+
+                break;
+
+            /* ================================================
+               COMANDO INVALIDO
+               ================================================ */
+
+            default:
+
+                respuesta =
+                    "Comando invalido. Usa LECTURA o GUARDADO.\r\n";
+
+                break;
+        }
+
+        /* ====================================================
+           MOSTRAR EN MONITOR SERIAL
+           ==================================================== */
+
+        Serial.print(
+            respuesta
+        );
+
+        /* ====================================================
+           CONFIRMAR RECEPCION AL IPHONE
+           ==================================================== */
+
+        if (mensaje.desdeBLE)
+        {
+            NotificarBLE(
+                respuesta
+            );
+        }
+    }
+
+    /* ========================================================
+       VERIFICAR COLA LLENA
+       ======================================================== */
+
+    if (colaLlena)
+    {
+        colaLlena = false;
+
+        Serial.println(
+            "Cola de comandos llena."
+        );
+
+        NotificarBLE(
+            "Cola llena. Repite el comando.\r\n"
+        );
+    }
+}
+
+/* ============================================================
+ * PROCESAR RESPUESTAS DESDE NUCLEO 1
+ * ============================================================ */
+
+static void ProcesarLineaNucleo(
+    const String &linea)
+{
+    String respuesta =
+        linea;
+
+    respuesta.trim();
+
+    if (respuesta.length() == 0)
+    {
+        return;
+    }
+
+    /* ========================================================
+       MOSTRAR RESPUESTA EN MONITOR SERIAL
+       ======================================================== */
+
+    Serial.println(
+        respuesta
+    );
+
+    /* ========================================================
+       GUARDADO EXITOSO
+       ======================================================== */
+
+    if (respuesta == "SD_OK")
+    {
+        NotificarBLE(
+            "SD_OK: Medicion guardada correctamente.\r\n"
+        );
+    }
+
+    /* ========================================================
+       ERROR DE ALMACENAMIENTO
+       ======================================================== */
+
+    else if (respuesta == "SD_ERROR")
+    {
+        NotificarBLE(
+            "SD_ERROR: No se pudo guardar la medicion.\r\n"
+        );
+    }
+
+    /* ========================================================
+       NO EXISTE MEDICION VALIDA
+       ======================================================== */
+
+    else if (respuesta == "SD_SIN_DATOS")
+    {
+        NotificarBLE(
+            "SD_SIN_DATOS: Primero realiza una lectura.\r\n"
+        );
+    }
+
+    /* ========================================================
+       TARJETA OCUPADA
+       ======================================================== */
+
+    else if (respuesta == "SD_OCUPADA")
+    {
+        NotificarBLE(
+            "SD_OCUPADA: Espera el guardado anterior.\r\n"
+        );
+    }
+
+    /* ========================================================
+       ERROR DE UART ENTRE LAS NUCLEO
+       ======================================================== */
+
+    else if (respuesta == "ERROR_UART3")
+    {
+        NotificarBLE(
+            "ERROR_UART3: Fallo de comunicacion con Nucleo 2.\r\n"
+        );
+    }
+
+    /* ========================================================
+       TEMPERATURA Y OTRAS RESPUESTAS
+       ======================================================== */
+
+    else
+    {
+        respuesta += "\r\n";
+
+        NotificarBLE(
+            respuesta.c_str()
+        );
+    }
+}
+
+/* ============================================================
+ * LEER RESPUESTAS DE NUCLEO 1
+ * ============================================================ */
+
+static void LeerNucleo(void)
+{
+    while (Serial2.available() > 0)
+    {
+        int dato =
+            Serial2.read();
+
+        if (dato < 0)
+        {
+            break;
+        }
+
+        /* ====================================================
+           DETECTAR FINAL DE MENSAJE
+           ==================================================== */
+
+        if (dato == '\r' ||
+            dato == '\n')
+        {
+            if (!descartarNucleo &&
+                entradaNucleo.length() > 0)
+            {
+                ProcesarLineaNucleo(
+                    entradaNucleo
+                );
+            }
+
+            entradaNucleo = "";
+
+            descartarNucleo = false;
+
+            continue;
+        }
+
+        /* ====================================================
+           IGNORAR MENSAJE DESCARTADO
+           ==================================================== */
+
+        if (descartarNucleo)
+        {
+            continue;
+        }
+
+        /* ====================================================
+           ALMACENAR CARACTERES
+           ==================================================== */
+
+        if (entradaNucleo.length() < TAM_RESPUESTA)
+        {
+            entradaNucleo += (char)dato;
+        }
+        else
+        {
+            entradaNucleo = "";
+
+            descartarNucleo = true;
+
+            Serial.println(
+                "Respuesta UART demasiado larga."
+            );
+        }
+    }
+}
+
+/* ============================================================
+ * CONFIGURACION INICIAL
+ * ============================================================ */
+
+void setup()
+{
+    /* ========================================================
+       INICIAR MONITOR SERIAL USB
+       ======================================================== */
+
+    Serial.begin(
+        VELOCIDAD_UART
+    );
+
+    /* ========================================================
+       INICIAR UART CON NUCLEO 1
+       ======================================================== */
+
+    Serial2.begin(
+        VELOCIDAD_UART,
+        SERIAL_8N1,
+        ESP32_RX_NUCLEO,
+        ESP32_TX_NUCLEO
+    );
+
+    entradaUSB.reserve(
+        TAM_COMANDO + 1U
+    );
+
+    entradaNucleo.reserve(
+        TAM_RESPUESTA + 1U
+    );
+
+    /* ========================================================
+       CREAR COLA DE COMANDOS
+       ======================================================== */
+
+    colaComandos = xQueueCreate(
+        TAM_COLA,
+        sizeof(MensajeComando)
+    );
+
+    if (colaComandos == nullptr)
+    {
+        Serial.println(
+            "ERROR: No se pudo crear la cola."
+        );
+
+        while (true)
+        {
+            delay(1000);
+        }
+    }
+
+    /* ========================================================
+       INICIAR BLUETOOTH BLE
+       ======================================================== */
+
+    BLEDevice::init(
+        NOMBRE_BLE
+    );
+
+    /* ========================================================
+       CREAR SERVIDOR BLE
+       ======================================================== */
+
+    BLEServer *servidor =
+        BLEDevice::createServer();
+
+    servidor->setCallbacks(
+        new EventosServidor()
+    );
+
+    /* ========================================================
+       CREAR SERVICIO NORDIC UART
+       ======================================================== */
+
+    BLEService *servicio =
+        servidor->createService(
+            UUID_SERVICIO
+        );
+
+    /* ========================================================
+       CARACTERISTICA TX - ESP32 A IPHONE
+       ======================================================== */
+
+    caracteristicaTX =
+        servicio->createCharacteristic(
+            UUID_TX,
+            BLECharacteristic::PROPERTY_NOTIFY
+        );
+
+    caracteristicaTX->addDescriptor(
+        new BLE2902()
+    );
+
+    /* ========================================================
+       CARACTERISTICA RX - IPHONE A ESP32
+       ======================================================== */
+
+    BLECharacteristic *caracteristicaRX =
+        servicio->createCharacteristic(
+            UUID_RX,
+            BLECharacteristic::PROPERTY_WRITE |
+            BLECharacteristic::PROPERTY_WRITE_NR
+        );
+
+    caracteristicaRX->setCallbacks(
+        new EventosRecepcion()
+    );
+
+    /* ========================================================
+       INICIAR SERVICIO BLE
+       ======================================================== */
+
+    servicio->start();
+
+    /* ========================================================
+       CONFIGURAR PUBLICIDAD
+       ======================================================== */
+
+    BLEAdvertising *publicidad =
+        BLEDevice::getAdvertising();
+
+    publicidad->addServiceUUID(
+        UUID_SERVICIO
+    );
+
+    publicidad->setScanResponse(
+        true
+    );
+
+    publicidad->start();
+
+    /* ========================================================
+       MENSAJES DE INICIO
+       ======================================================== */
+
+    Serial.println();
+
+    Serial.println(
+        "================================"
+    );
+
+    Serial.println(
+        "PROYECTO 03 - ESP32"
+    );
+
+    Serial.println(
+        "================================"
+    );
+
+    Serial.println(
+        "Bluetooth BLE iniciado."
+    );
+
+    Serial.print(
+        "Nombre: "
+    );
+
+    Serial.println(
+        NOMBRE_BLE
+    );
+
+    Serial.println(
+        "UART hacia Nucleo 1: 115200"
+    );
+
+    Serial.println(
+        "Comandos disponibles:"
+    );
+
+    Serial.println(
+        "LECTURA"
+    );
+
+    Serial.println(
+        "GUARDADO"
+    );
+
+    Serial.println(
+        "================================"
+    );
+
+    Serial.println(
+        "Busca el dispositivo en nRF Connect."
+    );
+
+    Serial.println(
+        "Activa las notificaciones de UUID_TX."
+    );
+
+    Serial.println(
+        "Esperando conexion BLE..."
+    );
+}
+
+/* ============================================================
+ * CICLO PRINCIPAL
+ * ============================================================ */
+
+void loop()
+{
+    bool conexionActual =
+        conectado;
+
+    /* ========================================================
+       IPHONE CONECTADO
+       ======================================================== */
+
+    if (conexionActual &&
+        !conectadoAnterior)
+    {
+        Serial.println(
+            "iPhone conectado por BLE."
+        );
+    }
+
+    /* ========================================================
+       IPHONE DESCONECTADO
+       ======================================================== */
+
+    if (!conexionActual &&
+        conectadoAnterior)
+    {
+        Serial.println(
+            "iPhone desconectado."
+        );
+    }
+
+    conectadoAnterior =
+        conexionActual;
+
+    /* ========================================================
+       REINICIAR PUBLICIDAD BLE
+       ======================================================== */
+
+    if (reiniciarPublicidad)
+    {
+        reiniciarPublicidad = false;
+
+        delay(100);
+
+        if (!conectado)
+        {
+            BLEDevice::startAdvertising();
+
+            Serial.println(
+                "Esperando conexion BLE."
+            );
+        }
+    }
+
+    /* ========================================================
+       LEER COMANDOS DESDE USB
+       ======================================================== */
+
+    LeerUSB();
+
+    /* ========================================================
+       PROCESAR COMANDOS BLE / USB
+       ======================================================== */
+
+    ProcesarComandos();
+
+    /* ========================================================
+       RECIBIR RESPUESTAS DESDE NUCLEO 1
+       ======================================================== */
+
+    LeerNucleo();
+
+    delay(1);
+}
+
+/*
+ * ============================================================
+ * FUNCIONAMIENTO ESPERADO
+ * ============================================================
+ *
+ * IPHONE:
+ *
+ * 1. Conectarse a Proyecto03_ESP32.
+ * 2. Activar notificaciones en UUID_TX.
+ * 3. Escribir LECTURA en UUID_RX.
+ * 4. Recibir temperatura desde Nucleo 1.
+ * 5. Escribir GUARDADO en UUID_RX.
+ * 6. Recibir SD_OK, SD_ERROR o SD_SIN_DATOS.
+ *
+ * IMPORTANTE:
+ *
+ * "GUARDADO enviado" solamente confirma que el ESP32
+ * transmitio la solicitud a Nucleo 1.
+ *
+ * El almacenamiento se considera exitoso unicamente
+ * cuando Nucleo 2 devuelve SD_OK.
+ *
+ * ============================================================
+ */
