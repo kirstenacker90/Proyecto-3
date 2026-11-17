@@ -1,0 +1,2403 @@
+/* USER CODE BEGIN Header */
+/*
+ * PROYECTO 03 - NUCLEO 2
+ * STM32F302R8
+ *
+ * LM75B: I2C1
+ * ILI9341: SPI3
+ * microSD: SPI2 + FatFs
+ * Nucleo 1: USART1 115200
+ * Hercules: USART2 38400
+ *
+ * Archivo: MEDICION.CSV
+ *
+ * Se conservan los comandos LECTURA y GUARDADO.
+ * Se mantienen todas las funciones del proyecto.
+ *
+ * UART Hercules:
+ * Esperando comandos...
+ * Temperatura: XX.XX C
+ * SD_OK
+ */
+/* USER CODE END Header */
+
+#include "main.h"
+#include "fatfs.h"
+#include "ff.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+
+/* ============================================================
+   CONFIGURACION
+   ============================================================ */
+
+#define ESPERA_MEDICION       1500U
+#define DURACION_RESULTADO    3000U
+
+#define UMBRAL_FRIO           2000
+#define UMBRAL_CALIENTE       2600
+
+#define TAM_COLA              128U
+#define TAM_COMANDO           32U
+
+#define TFT_ANCHO             320U
+#define TFT_ALTO              240U
+
+#define ARCHIVO_SD            "0:/MEDICION.CSV"
+
+/* ============================================================
+   COLORES TFT RGB565
+   ============================================================ */
+
+#define FONDO       0x10E7U
+#define PANEL       0x19C9U
+#define BARRA       0x2A6CU
+
+#define CELESTE     0x7EDFU
+#define AZUL_CLARO  0xA6BCU
+
+#define BLANCO      0xFFFFU
+#define VERDE       0x6F55U
+#define ROJO        0xF9A7U
+#define AMARILLO    0xFD63U
+
+/* ============================================================
+   PERIFERICOS
+   ============================================================ */
+
+I2C_HandleTypeDef hi2c1;
+
+SPI_HandleTypeDef hspi2;
+SPI_HandleTypeDef hspi3;
+
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+
+/* ============================================================
+   ESTADOS
+   ============================================================ */
+
+typedef enum
+{
+    REPOSO,
+    MIDIENDO,
+    ESTADO_OK,
+    ALERTA,
+    ERROR_I2C
+
+} Estado;
+
+static Estado estado = REPOSO;
+
+static uint32_t t0 = 0U;
+
+static uint8_t solicitudLectura = 0U;
+static uint8_t solicitudGuardado = 0U;
+
+static uint8_t sensorPreparado = 0U;
+static uint8_t medicionValida = 0U;
+
+static uint16_t direccionSensor = 0U;
+
+static int32_t temperatura = 0;
+static int32_t ultimaTemperaturaValida = 0;
+
+static const char *motivoError = "Sin diagnostico";
+
+/* ============================================================
+   RECEPCION UART
+   ============================================================ */
+
+static uint8_t datoUART;
+
+static uint8_t colaUART[TAM_COLA];
+
+static volatile uint16_t escrituraUART = 0U;
+static volatile uint16_t lecturaUART = 0U;
+
+static volatile uint8_t errorUART = 0U;
+
+static char comando[TAM_COMANDO];
+
+static uint16_t longitudComando = 0U;
+static uint8_t descartarComando = 0U;
+
+/* ============================================================
+   MICROSD
+   ============================================================ */
+
+static FATFS sdFatFs;
+static FIL sdArchivo;
+
+static volatile uint8_t sdOperacionActiva = 0U;
+
+static uint32_t numeroIntentosSD = 0U;
+
+/* ============================================================
+   BUFFER TFT
+   ============================================================ */
+
+static uint8_t pixeles[1536];
+
+/* ============================================================
+   FUENTE 5X7
+   ============================================================ */
+
+static const uint8_t fuente[36][5] =
+{
+    {0x3E,0x51,0x49,0x45,0x3E},
+    {0x00,0x42,0x7F,0x40,0x00},
+    {0x42,0x61,0x51,0x49,0x46},
+    {0x21,0x41,0x45,0x4B,0x31},
+    {0x18,0x14,0x12,0x7F,0x10},
+    {0x27,0x45,0x45,0x45,0x39},
+    {0x3C,0x4A,0x49,0x49,0x30},
+    {0x01,0x71,0x09,0x05,0x03},
+    {0x36,0x49,0x49,0x49,0x36},
+    {0x06,0x49,0x49,0x29,0x1E},
+
+    {0x7E,0x11,0x11,0x11,0x7E},
+    {0x7F,0x49,0x49,0x49,0x36},
+    {0x3E,0x41,0x41,0x41,0x22},
+    {0x7F,0x41,0x41,0x22,0x1C},
+    {0x7F,0x49,0x49,0x49,0x41},
+    {0x7F,0x09,0x09,0x09,0x01},
+    {0x3E,0x41,0x49,0x49,0x7A},
+    {0x7F,0x08,0x08,0x08,0x7F},
+    {0x00,0x41,0x7F,0x41,0x00},
+    {0x20,0x40,0x41,0x3F,0x01},
+    {0x7F,0x08,0x14,0x22,0x41},
+    {0x7F,0x40,0x40,0x40,0x40},
+    {0x7F,0x02,0x0C,0x02,0x7F},
+    {0x7F,0x04,0x08,0x10,0x7F},
+    {0x3E,0x41,0x41,0x41,0x3E},
+    {0x7F,0x09,0x09,0x09,0x06},
+    {0x3E,0x41,0x51,0x21,0x5E},
+    {0x7F,0x09,0x19,0x29,0x46},
+    {0x46,0x49,0x49,0x49,0x31},
+    {0x01,0x01,0x7F,0x01,0x01},
+    {0x3F,0x40,0x40,0x40,0x3F},
+    {0x1F,0x20,0x40,0x20,0x1F},
+    {0x3F,0x40,0x38,0x40,0x3F},
+    {0x63,0x14,0x08,0x14,0x63},
+    {0x07,0x08,0x70,0x08,0x07},
+    {0x61,0x51,0x49,0x45,0x43}
+};
+
+/* ============================================================
+   PROTOTIPOS
+   ============================================================ */
+
+void SystemClock_Config(void);
+
+static void MX_GPIO_Init(void);
+static void MX_I2C1_Init(void);
+static void MX_SPI2_Init(void);
+static void MX_SPI3_Init(void);
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+
+static void UART_Texto(
+    UART_HandleTypeDef *uart,
+    const char *mensaje
+);
+
+static void UART_Responder(const char *mensaje);
+
+static void DEBUG_Print(const char *formato, ...);
+
+static void FormatearTemperatura(
+    char *destino,
+    size_t tam,
+    int32_t valor
+);
+
+static void ProcesarUART(void);
+
+static HAL_StatusTypeDef Sensor_Iniciar(void);
+
+static HAL_StatusTypeDef Sensor_Temperatura(
+    int32_t *resultado
+);
+
+static void SD_GuardarTemperatura(void);
+
+static void TFT_Iniciar(void);
+static void TFT_MostrarEspera(void);
+static void TFT_MostrarError(void);
+
+static void TFT_MostrarValor(
+    const char *valor,
+    int32_t temp
+);
+
+/* ============================================================
+   UART
+   ============================================================ */
+
+static void UART_Texto(
+    UART_HandleTypeDef *uart,
+    const char *mensaje)
+{
+    if (uart == NULL || mensaje == NULL)
+    {
+        return;
+    }
+
+    HAL_UART_Transmit(
+        uart,
+        (uint8_t *)mensaje,
+        (uint16_t)strlen(mensaje),
+        1000
+    );
+}
+
+static void UART_Responder(const char *mensaje)
+{
+    UART_Texto(&huart2, mensaje);
+    UART_Texto(&huart1, mensaje);
+}
+
+/* ============================================================
+   DEBUG DESACTIVADO
+
+   Se conservan las llamadas originales para no modificar
+   la logica del proyecto, pero ya no se imprimen.
+   ============================================================ */
+
+static void DEBUG_Print(const char *formato, ...)
+{
+    (void)formato;
+}
+
+/* ============================================================
+   FORMATEAR TEMPERATURA
+   ============================================================ */
+
+static void FormatearTemperatura(
+    char *destino,
+    size_t tam,
+    int32_t valor)
+{
+    int32_t absoluto =
+        valor < 0 ? -valor : valor;
+
+    snprintf(
+        destino,
+        tam,
+        "%s%ld.%02ld",
+        valor < 0 ? "-" : "",
+        (long)(absoluto / 100),
+        (long)(absoluto % 100)
+    );
+}
+
+/* ============================================================
+   SENSOR LM75B
+   ============================================================ */
+
+static HAL_StatusTypeDef Sensor_Iniciar(void)
+{
+    for (uint8_t dir = 0x48U; dir <= 0x4FU; dir++)
+    {
+        uint16_t direccion =
+            (uint16_t)dir << 1;
+
+        if (HAL_I2C_IsDeviceReady(
+                &hi2c1,
+                direccion,
+                3,
+                100
+            ) == HAL_OK)
+        {
+            direccionSensor = direccion;
+
+            motivoError = "Sin diagnostico";
+
+            DEBUG_Print(
+                "[LM75 DEBUG] Sensor encontrado en 0x%02X\r\n",
+                dir
+            );
+
+            return HAL_OK;
+        }
+    }
+
+    motivoError = "LM75 no responde";
+
+    return HAL_ERROR;
+}
+
+static HAL_StatusTypeDef Sensor_Temperatura(
+    int32_t *resultado)
+{
+    uint8_t datos[2];
+
+    if (resultado == NULL)
+    {
+        return HAL_ERROR;
+    }
+
+    if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            direccionSensor,
+            0x00,
+            I2C_MEMADD_SIZE_8BIT,
+            datos,
+            2,
+            100
+        ) != HAL_OK)
+    {
+        motivoError =
+            "No se pudo leer temperatura LM75";
+
+        return HAL_ERROR;
+    }
+
+    uint16_t crudo =
+        ((uint16_t)datos[0] << 8) |
+        (uint16_t)datos[1];
+
+    int16_t onceBits =
+        (int16_t)(crudo >> 5);
+
+    if (onceBits & 0x0400)
+    {
+        onceBits =
+            (int16_t)(onceBits | 0xF800);
+    }
+
+    *resultado =
+        ((int32_t)onceBits * 100) / 8;
+
+    return HAL_OK;
+}
+
+/* ============================================================
+   PROCESAR COMANDOS UART
+   ============================================================ */
+
+static void ProcesarUART(void)
+{
+    if (errorUART)
+    {
+        errorUART = 0U;
+        longitudComando = 0U;
+        descartarComando = 1U;
+    }
+
+    while (lecturaUART != escrituraUART)
+    {
+        uint8_t dato =
+            colaUART[lecturaUART];
+
+        lecturaUART =
+            (lecturaUART + 1U) % TAM_COLA;
+
+        if (dato == '\r' || dato == '\n')
+        {
+            if (descartarComando)
+            {
+                descartarComando = 0U;
+                longitudComando = 0U;
+                continue;
+            }
+
+            if (longitudComando > 0U)
+            {
+                comando[longitudComando] = '\0';
+
+                DEBUG_Print(
+                    "[UART DEBUG] Comando recibido: %s\r\n",
+                    comando
+                );
+
+                if (!strcmp(comando, "LECTURA") ||
+                    !strcmp(comando, "LEER") ||
+                    !strcmp(comando, "L"))
+                {
+                    solicitudLectura = 1U;
+                }
+                else if (!strcmp(comando, "GUARDADO") ||
+                         !strcmp(comando, "GUARDAR") ||
+                         !strcmp(comando, "G"))
+                {
+                    solicitudGuardado = 1U;
+                }
+                else
+                {
+                    UART_Responder(
+                        "COMANDO_INVALIDO\r\n"
+                    );
+                }
+
+                longitudComando = 0U;
+            }
+
+            continue;
+        }
+
+        if (descartarComando)
+        {
+            continue;
+        }
+
+        if (dato >= 'a' && dato <= 'z')
+        {
+            dato =
+                (uint8_t)(dato - ('a' - 'A'));
+        }
+
+        if (dato >= 32U && dato <= 126U)
+        {
+            if (longitudComando < TAM_COMANDO - 1U)
+            {
+                comando[longitudComando++] =
+                    (char)dato;
+            }
+            else
+            {
+                longitudComando = 0U;
+                descartarComando = 1U;
+            }
+        }
+    }
+}
+
+/* ============================================================
+   DIAGNOSTICO FATFS
+   ============================================================ */
+
+static const char *SD_DescripcionError(FRESULT error)
+{
+    switch (error)
+    {
+        case FR_OK:
+            return "Operacion correcta";
+
+        case FR_DISK_ERR:
+            return "Error de lectura/escritura";
+
+        case FR_INT_ERR:
+            return "Error interno FatFs";
+
+        case FR_NOT_READY:
+            return "Unidad no lista";
+
+        case FR_NO_FILE:
+            return "Archivo no encontrado";
+
+        case FR_NO_PATH:
+            return "Ruta no encontrada";
+
+        case FR_INVALID_NAME:
+            return "Nombre invalido";
+
+        case FR_DENIED:
+            return "Acceso denegado";
+
+        case FR_EXIST:
+            return "Archivo existente";
+
+        case FR_INVALID_OBJECT:
+            return "Objeto invalido";
+
+        case FR_WRITE_PROTECTED:
+            return "Escritura protegida";
+
+        case FR_INVALID_DRIVE:
+            return "Unidad invalida";
+
+        case FR_NOT_ENABLED:
+            return "Sistema no habilitado";
+
+        case FR_NO_FILESYSTEM:
+            return "FAT no encontrado";
+
+        case FR_MKFS_ABORTED:
+            return "Error de formato";
+
+        case FR_TIMEOUT:
+            return "Tiempo agotado";
+
+        case FR_LOCKED:
+            return "Archivo bloqueado";
+
+        case FR_NOT_ENOUGH_CORE:
+            return "Memoria insuficiente";
+
+        case FR_TOO_MANY_OPEN_FILES:
+            return "Demasiados archivos";
+
+        case FR_INVALID_PARAMETER:
+            return "Parametro invalido";
+
+        default:
+            return "Error desconocido";
+    }
+}
+
+static void SD_MostrarResultado(
+    const char *etapa,
+    FRESULT resultado)
+{
+    if (resultado != FR_OK)
+    {
+        DEBUG_Print(
+            "[SD DEBUG] %s = %d (%s)\r\n",
+            etapa,
+            (int)resultado,
+            SD_DescripcionError(resultado)
+        );
+    }
+}
+
+/* ============================================================
+   FUNCION PRINCIPAL DE GUARDADO MICROSD
+   ============================================================ */
+
+static void SD_GuardarTemperatura(void)
+{
+    FRESULT resultado = FR_OK;
+
+    FRESULT resultadoCierre = FR_OK;
+    FRESULT resultadoDesmontar = FR_OK;
+
+    UINT escritos = 0U;
+    UINT leidos = 0U;
+
+    char valor[20];
+    char registro[80];
+
+    uint8_t bufferLectura[128];
+
+    uint32_t numeroMedicion = 1U;
+    uint32_t lineasEncontradas = 0U;
+
+    uint32_t tamanoInicial = 0U;
+
+    int longitudRegistro;
+
+    const char *etapaError = "NINGUNA";
+
+    uint8_t archivoAbierto = 0U;
+    uint8_t sistemaMontado = 0U;
+
+    numeroIntentosSD++;
+
+    DEBUG_Print(
+        "\r\n========================================\r\n"
+        "[SD DEBUG] INICIO DE GUARDADO\r\n"
+        "[SD DEBUG] Intento: %lu\r\n"
+        "========================================\r\n",
+        (unsigned long)numeroIntentosSD
+    );
+
+    /* --------------------------------------------------------
+       PASO 1: VALIDACIONES
+       -------------------------------------------------------- */
+
+    if (sdOperacionActiva)
+    {
+        DEBUG_Print(
+            "[SD DEBUG] Operacion SD ocupada\r\n"
+        );
+
+        UART_Responder("SD_ERROR\r\n");
+        return;
+    }
+
+    if (!medicionValida)
+    {
+        DEBUG_Print(
+            "[SD DEBUG] No hay medicion valida\r\n"
+        );
+
+        UART_Responder("SD_SIN_DATOS\r\n");
+        return;
+    }
+
+    sdOperacionActiva = 1U;
+
+    FormatearTemperatura(
+        valor,
+        sizeof(valor),
+        ultimaTemperaturaValida
+    );
+
+    DEBUG_Print(
+        "[SD DEBUG] Temperatura: %s C\r\n",
+        valor
+    );
+
+    /* --------------------------------------------------------
+       PASO 2: COMPROBAR FATFS
+       -------------------------------------------------------- */
+
+    if (retUSER != 0U)
+    {
+        etapaError = "FATFS_LinkDriver";
+        goto error_sd;
+    }
+
+    /* --------------------------------------------------------
+       PASO 3: MONTAR MICROSD
+       -------------------------------------------------------- */
+
+    resultado = f_mount(
+        &sdFatFs,
+        "0:",
+        1
+    );
+
+    SD_MostrarResultado("f_mount", resultado);
+
+    if (resultado != FR_OK)
+    {
+        etapaError = "f_mount";
+        goto error_sd;
+    }
+
+    sistemaMontado = 1U;
+
+    /* --------------------------------------------------------
+       PASO 4: ABRIR O CREAR CSV
+       -------------------------------------------------------- */
+
+    resultado = f_open(
+        &sdArchivo,
+        ARCHIVO_SD,
+        FA_OPEN_ALWAYS | FA_READ | FA_WRITE
+    );
+
+    SD_MostrarResultado("f_open", resultado);
+
+    if (resultado != FR_OK)
+    {
+        etapaError = "f_open";
+        goto error_sd;
+    }
+
+    archivoAbierto = 1U;
+
+    tamanoInicial =
+        (uint32_t)f_size(&sdArchivo);
+
+    /* --------------------------------------------------------
+       PASO 5: CONTAR MEDICIONES ANTERIORES
+       -------------------------------------------------------- */
+
+    if (tamanoInicial > 0U)
+    {
+        resultado = f_lseek(
+            &sdArchivo,
+            0U
+        );
+
+        SD_MostrarResultado(
+            "f_lseek inicio",
+            resultado
+        );
+
+        if (resultado != FR_OK)
+        {
+            etapaError = "f_lseek inicio";
+            goto error_sd;
+        }
+
+        do
+        {
+            leidos = 0U;
+
+            resultado = f_read(
+                &sdArchivo,
+                bufferLectura,
+                sizeof(bufferLectura),
+                &leidos
+            );
+
+            if (resultado != FR_OK)
+            {
+                etapaError = "f_read contador";
+                goto error_sd;
+            }
+
+            for (UINT i = 0U; i < leidos; i++)
+            {
+                if (bufferLectura[i] == '\n')
+                {
+                    lineasEncontradas++;
+                }
+            }
+
+        } while (leidos > 0U);
+
+        if (lineasEncontradas > 0U)
+        {
+            numeroMedicion = lineasEncontradas;
+        }
+    }
+
+    /* --------------------------------------------------------
+       PASO 6: IR AL FINAL DEL ARCHIVO
+       -------------------------------------------------------- */
+
+    resultado = f_lseek(
+        &sdArchivo,
+        f_size(&sdArchivo)
+    );
+
+    SD_MostrarResultado(
+        "f_lseek final",
+        resultado
+    );
+
+    if (resultado != FR_OK)
+    {
+        etapaError = "f_lseek final";
+        goto error_sd;
+    }
+
+    /* --------------------------------------------------------
+       PASO 7: ESCRIBIR ENCABEZADO SI ES NUEVO
+       -------------------------------------------------------- */
+
+    if (tamanoInicial == 0U)
+    {
+        const char encabezado[] =
+            "Medicion,Temperatura\r\n";
+
+        UINT cantidadEsperada =
+            (UINT)(sizeof(encabezado) - 1U);
+
+        escritos = 0U;
+
+        resultado = f_write(
+            &sdArchivo,
+            encabezado,
+            cantidadEsperada,
+            &escritos
+        );
+
+        SD_MostrarResultado(
+            "f_write encabezado",
+            resultado
+        );
+
+        if (resultado != FR_OK ||
+            escritos != cantidadEsperada)
+        {
+            etapaError = "f_write encabezado";
+            goto error_sd;
+        }
+
+        DEBUG_Print(
+            "[SD DEBUG] Encabezado creado\r\n"
+        );
+    }
+
+    /* --------------------------------------------------------
+       PASO 8: PREPARAR MEDICION Y TEMPERATURA
+       -------------------------------------------------------- */
+
+    longitudRegistro = snprintf(
+        registro,
+        sizeof(registro),
+        "Medicion %lu,%s C\r\n",
+        (unsigned long)numeroMedicion,
+        valor
+    );
+
+    if (longitudRegistro <= 0 ||
+        longitudRegistro >= (int)sizeof(registro))
+    {
+        etapaError = "snprintf registro";
+        goto error_sd;
+    }
+
+    /* --------------------------------------------------------
+       PASO 9: ESCRIBIR REGISTRO
+       -------------------------------------------------------- */
+
+    escritos = 0U;
+
+    resultado = f_write(
+        &sdArchivo,
+        registro,
+        (UINT)longitudRegistro,
+        &escritos
+    );
+
+    SD_MostrarResultado(
+        "f_write temperatura",
+        resultado
+    );
+
+    if (resultado != FR_OK ||
+        escritos != (UINT)longitudRegistro)
+    {
+        etapaError = "f_write temperatura";
+        goto error_sd;
+    }
+
+    /* --------------------------------------------------------
+       PASO 10: SINCRONIZAR
+       -------------------------------------------------------- */
+
+    resultado = f_sync(&sdArchivo);
+
+    SD_MostrarResultado(
+        "f_sync",
+        resultado
+    );
+
+    if (resultado != FR_OK)
+    {
+        etapaError = "f_sync";
+        goto error_sd;
+    }
+
+    /* --------------------------------------------------------
+       PASO 11: CERRAR ARCHIVO
+       -------------------------------------------------------- */
+
+    resultadoCierre = f_close(&sdArchivo);
+
+    SD_MostrarResultado(
+        "f_close",
+        resultadoCierre
+    );
+
+    archivoAbierto = 0U;
+
+    if (resultadoCierre != FR_OK)
+    {
+        resultado = resultadoCierre;
+        etapaError = "f_close";
+        goto error_sd;
+    }
+
+    /* --------------------------------------------------------
+       PASO 12: DESMONTAR MICROSD
+       -------------------------------------------------------- */
+
+    resultadoDesmontar = f_mount(
+        NULL,
+        "0:",
+        0
+    );
+
+    SD_MostrarResultado(
+        "f_mount desmontar",
+        resultadoDesmontar
+    );
+
+    sistemaMontado = 0U;
+
+    if (resultadoDesmontar != FR_OK)
+    {
+        resultado = resultadoDesmontar;
+        etapaError = "f_mount desmontar";
+        goto error_sd;
+    }
+
+    /* --------------------------------------------------------
+       GUARDADO EXITOSO
+       -------------------------------------------------------- */
+
+    sdOperacionActiva = 0U;
+
+    DEBUG_Print(
+        "\r\n========================================\r\n"
+        "[SD DEBUG] GUARDADO COMPLETADO\r\n"
+        "[SD DEBUG] Medicion %lu: %s C\r\n"
+        "[SD DEBUG] Archivo MEDICION.CSV actualizado\r\n"
+        "========================================\r\n\r\n",
+        (unsigned long)numeroMedicion,
+        valor
+    );
+
+    UART_Responder("SD_OK\r\n");
+
+    return;
+
+    /* --------------------------------------------------------
+       MANEJO DE ERRORES
+       -------------------------------------------------------- */
+
+error_sd:
+
+    DEBUG_Print(
+        "\r\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\r\n"
+        "[SD DEBUG] ERROR DETECTADO\r\n"
+        "[SD DEBUG] Etapa fallida: %s\r\n"
+        "[SD DEBUG] Codigo FatFs: %d\r\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\r\n",
+        etapaError,
+        (int)resultado
+    );
+
+    if (archivoAbierto)
+    {
+        FRESULT cierre = f_close(&sdArchivo);
+
+        SD_MostrarResultado(
+            "f_close limpieza",
+            cierre
+        );
+    }
+
+    if (sistemaMontado)
+    {
+        FRESULT desmontar = f_mount(
+            NULL,
+            "0:",
+            0
+        );
+
+        SD_MostrarResultado(
+            "f_mount limpieza",
+            desmontar
+        );
+    }
+
+    sdOperacionActiva = 0U;
+
+    UART_Responder("SD_ERROR\r\n");
+}
+
+/* ============================================================
+   TFT - ENVIO SPI3
+   ============================================================ */
+
+static void SPI_Enviar(
+    const uint8_t *datos,
+    uint16_t cantidad)
+{
+    if (HAL_SPI_Transmit(
+            &hspi3,
+            (uint8_t *)datos,
+            cantidad,
+            1000
+        ) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void TFT_Comando(
+    uint8_t cmd,
+    const uint8_t *datos,
+    uint16_t cantidad)
+{
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_RESET
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_DC_GPIO_Port,
+        TFT_DC_Pin,
+        GPIO_PIN_RESET
+    );
+
+    SPI_Enviar(&cmd, 1U);
+
+    if (cantidad > 0U)
+    {
+        HAL_GPIO_WritePin(
+            TFT_DC_GPIO_Port,
+            TFT_DC_Pin,
+            GPIO_PIN_SET
+        );
+
+        SPI_Enviar(
+            datos,
+            cantidad
+        );
+    }
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_SET
+    );
+}
+
+/* ============================================================
+   TFT - VENTANA
+   ============================================================ */
+
+static void TFT_Ventana(
+    uint16_t x,
+    uint16_t y,
+    uint16_t w,
+    uint16_t h)
+{
+    uint16_t fx = x + w - 1U;
+    uint16_t fy = y + h - 1U;
+
+    uint8_t columnas[] =
+    {
+        (uint8_t)(x >> 8),
+        (uint8_t)(x & 255U),
+        (uint8_t)(fx >> 8),
+        (uint8_t)(fx & 255U)
+    };
+
+    uint8_t filas[] =
+    {
+        (uint8_t)(y >> 8),
+        (uint8_t)(y & 255U),
+        (uint8_t)(fy >> 8),
+        (uint8_t)(fy & 255U)
+    };
+
+    uint8_t cmd = 0x2CU;
+
+    TFT_Comando(
+        0x2AU,
+        columnas,
+        sizeof(columnas)
+    );
+
+    TFT_Comando(
+        0x2BU,
+        filas,
+        sizeof(filas)
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_RESET
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_DC_GPIO_Port,
+        TFT_DC_Pin,
+        GPIO_PIN_RESET
+    );
+
+    SPI_Enviar(&cmd, 1U);
+
+    HAL_GPIO_WritePin(
+        TFT_DC_GPIO_Port,
+        TFT_DC_Pin,
+        GPIO_PIN_SET
+    );
+}
+
+/* ============================================================
+   TFT - RECTANGULO
+   ============================================================ */
+
+static void TFT_Rectangulo(
+    uint16_t x,
+    uint16_t y,
+    uint16_t w,
+    uint16_t h,
+    uint16_t color)
+{
+    if (x >= TFT_ANCHO ||
+        y >= TFT_ALTO ||
+        w == 0U ||
+        h == 0U)
+    {
+        return;
+    }
+
+    if (w > TFT_ANCHO - x)
+    {
+        w = TFT_ANCHO - x;
+    }
+
+    if (h > TFT_ALTO - y)
+    {
+        h = TFT_ALTO - y;
+    }
+
+    for (uint16_t i = 0U; i < 256U; i++)
+    {
+        pixeles[2U * i] =
+            (uint8_t)(color >> 8);
+
+        pixeles[2U * i + 1U] =
+            (uint8_t)(color & 255U);
+    }
+
+    TFT_Ventana(x, y, w, h);
+
+    uint32_t restantes =
+        (uint32_t)w * h;
+
+    while (restantes > 0U)
+    {
+        uint16_t cantidad =
+            restantes > 256U
+            ? 256U
+            : (uint16_t)restantes;
+
+        SPI_Enviar(
+            pixeles,
+            (uint16_t)(cantidad * 2U)
+        );
+
+        restantes -= cantidad;
+    }
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_SET
+    );
+}
+
+/* ============================================================
+   TFT - FUENTE
+   ============================================================ */
+
+static uint8_t Fuente_Columna(
+    char c,
+    uint8_t columna)
+{
+    if (c >= '0' && c <= '9')
+    {
+        return fuente[c - '0'][columna];
+    }
+
+    if (c >= 'A' && c <= 'Z')
+    {
+        return fuente[10 + c - 'A'][columna];
+    }
+
+    if (c == '-')
+    {
+        return 0x08U;
+    }
+
+    if (c == '.')
+    {
+        return columna == 2U ? 0x60U : 0U;
+    }
+
+    if (c == ':')
+    {
+        return columna == 2U ? 0x36U : 0U;
+    }
+
+    if (c == '%')
+    {
+        return columna == 2U ? 0x14U : 0x62U;
+    }
+
+    return 0U;
+}
+
+/* ============================================================
+   TFT - CARACTER
+   ============================================================ */
+
+static void TFT_Caracter(
+    uint16_t x,
+    uint16_t y,
+    char c,
+    uint8_t escala,
+    uint16_t frente,
+    uint16_t fondo)
+{
+    if (escala < 1U ||
+        escala > 4U ||
+        x + 6U * escala > TFT_ANCHO ||
+        y + 8U * escala > TFT_ALTO)
+    {
+        return;
+    }
+
+    uint16_t indice = 0U;
+
+    for (uint16_t fila = 0U;
+         fila < 8U * escala;
+         fila++)
+    {
+        for (uint16_t columna = 0U;
+             columna < 6U * escala;
+             columna++)
+        {
+            uint8_t encendido = 0U;
+
+            if (columna / escala < 5U)
+            {
+                encendido =
+                    (Fuente_Columna(
+                        c,
+                        (uint8_t)(columna / escala)
+                    ) >> (fila / escala)) & 1U;
+            }
+
+            uint16_t color =
+                encendido ? frente : fondo;
+
+            pixeles[indice++] =
+                (uint8_t)(color >> 8);
+
+            pixeles[indice++] =
+                (uint8_t)(color & 255U);
+        }
+    }
+
+    TFT_Ventana(
+        x,
+        y,
+        6U * escala,
+        8U * escala
+    );
+
+    SPI_Enviar(
+        pixeles,
+        indice
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_SET
+    );
+}
+
+/* ============================================================
+   TFT - TEXTO
+   ============================================================ */
+
+static void TFT_Texto(
+    uint16_t x,
+    uint16_t y,
+    const char *cadena,
+    uint8_t escala,
+    uint16_t frente,
+    uint16_t fondo)
+{
+    while (*cadena &&
+           x + 6U * escala <= TFT_ANCHO)
+    {
+        TFT_Caracter(
+            x,
+            y,
+            *cadena++,
+            escala,
+            frente,
+            fondo
+        );
+
+        x += 6U * escala;
+    }
+}
+
+/* ============================================================
+   TFT - TERMOMETRO
+   ============================================================ */
+
+static void TFT_Termometro(uint16_t color)
+{
+    TFT_Rectangulo(30, 69, 12, 38, BLANCO);
+    TFT_Rectangulo(33, 72, 6, 31, PANEL);
+    TFT_Rectangulo(35, 86, 2, 17, color);
+    TFT_Rectangulo(27, 101, 18, 14, BLANCO);
+    TFT_Rectangulo(30, 104, 12, 8, color);
+
+    TFT_Rectangulo(24, 77, 4, 2, CELESTE);
+    TFT_Rectangulo(24, 85, 4, 2, CELESTE);
+    TFT_Rectangulo(24, 93, 4, 2, CELESTE);
+}
+
+/* ============================================================
+   TFT - ESTRUCTURA
+   ============================================================ */
+
+static void TFT_Estructura(void)
+{
+    TFT_Rectangulo(
+        0, 0, 320, 240, FONDO
+    );
+
+    TFT_Texto(
+        12, 7,
+        "PROYECTO 03",
+        1,
+        CELESTE,
+        FONDO
+    );
+
+    TFT_Texto(
+        12, 20,
+        "MONITOR AMBIENTAL",
+        2,
+        BLANCO,
+        FONDO
+    );
+
+    TFT_Rectangulo(
+        12, 48, 296, 142, PANEL
+    );
+
+    TFT_Rectangulo(
+        12, 195, 296, 35, PANEL
+    );
+
+    TFT_Texto(
+        61, 63,
+        "TEMPERATURA ACTUAL",
+        1,
+        AZUL_CLARO,
+        PANEL
+    );
+
+    TFT_Texto(
+        27, 177,
+        "0 C",
+        1,
+        AZUL_CLARO,
+        PANEL
+    );
+
+    TFT_Texto(
+        264, 177,
+        "50 C",
+        1,
+        AZUL_CLARO,
+        PANEL
+    );
+
+    TFT_Texto(
+        236, 8,
+        "LM75 I2C",
+        1,
+        CELESTE,
+        FONDO
+    );
+}
+
+/* ============================================================
+   TFT - SIMBOLO DE GRADOS
+   ============================================================ */
+
+static void TFT_Grado(
+    uint16_t x,
+    uint16_t y,
+    uint16_t color)
+{
+    TFT_Rectangulo(x + 2, y, 6, 2, color);
+    TFT_Rectangulo(x, y + 2, 2, 6, color);
+    TFT_Rectangulo(x + 8, y + 2, 2, 6, color);
+    TFT_Rectangulo(x + 2, y + 8, 6, 2, color);
+}
+
+/* ============================================================
+   TFT - ESTADO
+   ============================================================ */
+
+static void TFT_MostrarEstado(
+    const char *titulo,
+    uint16_t color)
+{
+    TFT_Rectangulo(
+        12, 195, 296, 35, PANEL
+    );
+
+    TFT_Rectangulo(
+        26, 206, 12, 12, color
+    );
+
+    TFT_Texto(
+        47, 205,
+        titulo,
+        2,
+        color,
+        PANEL
+    );
+}
+
+/* ============================================================
+   TFT - MOSTRAR TEMPERATURA
+   ============================================================ */
+
+static void TFT_MostrarValor(
+    const char *valor,
+    int32_t temp)
+{
+    uint16_t color;
+    const char *mensajeEstado;
+
+    if (temp < UMBRAL_FRIO)
+    {
+        color = CELESTE;
+        mensajeEstado = "ESTADO FRIO";
+    }
+    else if (temp < UMBRAL_CALIENTE)
+    {
+        color = VERDE;
+        mensajeEstado = "ESTADO NORMAL";
+    }
+    else
+    {
+        color = ROJO;
+        mensajeEstado = "ESTADO CALIENTE";
+    }
+
+    TFT_Rectangulo(
+        22, 82, 276, 77, PANEL
+    );
+
+    TFT_Termometro(color);
+
+    uint16_t cantidad =
+        (uint16_t)strlen(valor);
+
+    uint8_t escala =
+        cantidad <= 6U ? 4U : 3U;
+
+    uint16_t x = 63U;
+
+    TFT_Texto(
+        x,
+        101,
+        valor,
+        escala,
+        BLANCO,
+        PANEL
+    );
+
+    uint16_t unidadX =
+        x + cantidad * 6U * escala + 5U;
+
+    TFT_Grado(
+        unidadX,
+        105,
+        CELESTE
+    );
+
+    TFT_Texto(
+        unidadX + 15U,
+        101,
+        "C",
+        3,
+        CELESTE,
+        PANEL
+    );
+
+    TFT_Rectangulo(
+        27, 163, 264, 9, BARRA
+    );
+
+    int32_t limitada = temp;
+
+    if (limitada < 0)
+    {
+        limitada = 0;
+    }
+
+    if (limitada > 5000)
+    {
+        limitada = 5000;
+    }
+
+    uint16_t largo =
+        (uint16_t)((limitada * 264) / 5000);
+
+    if (largo > 0U)
+    {
+        TFT_Rectangulo(
+            27,
+            163,
+            largo,
+            9,
+            color
+        );
+    }
+
+    TFT_MostrarEstado(
+        mensajeEstado,
+        color
+    );
+}
+
+/* ============================================================
+   TFT - ERROR
+   ============================================================ */
+
+static void TFT_MostrarError(void)
+{
+    TFT_Rectangulo(
+        22, 82, 276, 90, PANEL
+    );
+
+    TFT_Texto(
+        38, 108,
+        "ERROR SENSOR",
+        2,
+        ROJO,
+        PANEL
+    );
+
+    TFT_MostrarEstado(
+        "REVISAR LM75",
+        ROJO
+    );
+}
+
+/* ============================================================
+   TFT - ESPERA
+   ============================================================ */
+
+static void TFT_MostrarEspera(void)
+{
+    TFT_Rectangulo(
+        22, 82, 276, 90, PANEL
+    );
+
+    TFT_Termometro(CELESTE);
+
+    TFT_Texto(
+        75, 111,
+        "--.--",
+        3,
+        BLANCO,
+        PANEL
+    );
+
+    TFT_Grado(
+        171, 114,
+        CELESTE
+    );
+
+    TFT_Texto(
+        188, 111,
+        "C",
+        3,
+        CELESTE,
+        PANEL
+    );
+
+    TFT_MostrarEstado(
+        "ESPERANDO LECTURA",
+        CELESTE
+    );
+}
+
+/* ============================================================
+   TFT - INICIALIZACION ILI9341
+   ============================================================ */
+
+static void TFT_Iniciar(void)
+{
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_GPIO_WritePin(
+        TFT_RST_GPIO_Port,
+        TFT_RST_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_Delay(20);
+
+    HAL_GPIO_WritePin(
+        TFT_RST_GPIO_Port,
+        TFT_RST_Pin,
+        GPIO_PIN_RESET
+    );
+
+    HAL_Delay(20);
+
+    HAL_GPIO_WritePin(
+        TFT_RST_GPIO_Port,
+        TFT_RST_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_Delay(150);
+
+    TFT_Comando(0x01, NULL, 0);
+
+    HAL_Delay(150);
+
+    typedef struct
+    {
+        uint8_t cmd;
+        uint8_t cantidad;
+        uint8_t datos[15];
+
+    } ComandoTFT;
+
+    static const ComandoTFT configuracion[] =
+    {
+        {0xEF,3,{0x03,0x80,0x02}},
+        {0xCF,3,{0x00,0xC1,0x30}},
+        {0xED,4,{0x64,0x03,0x12,0x81}},
+        {0xE8,3,{0x85,0x00,0x78}},
+        {0xCB,5,{0x39,0x2C,0x00,0x34,0x02}},
+        {0xF7,1,{0x20}},
+        {0xEA,2,{0x00,0x00}},
+        {0xC0,1,{0x23}},
+        {0xC1,1,{0x10}},
+        {0xC5,2,{0x3E,0x28}},
+        {0xC7,1,{0x86}},
+        {0x36,1,{0x28}},
+        {0x3A,1,{0x55}},
+        {0xB1,2,{0x00,0x18}},
+        {0xB6,3,{0x08,0x82,0x27}},
+        {0xF2,1,{0x00}},
+        {0x26,1,{0x01}},
+
+        {0xE0,15,{
+            0x0F,0x31,0x2B,0x0C,0x0E,
+            0x08,0x4E,0xF1,0x37,0x07,
+            0x10,0x03,0x0E,0x09,0x00
+        }},
+
+        {0xE1,15,{
+            0x00,0x0E,0x14,0x03,0x11,
+            0x07,0x31,0xC1,0x48,0x08,
+            0x0F,0x0C,0x31,0x36,0x0F
+        }}
+    };
+
+    for (uint32_t i = 0U;
+         i < sizeof(configuracion) /
+             sizeof(configuracion[0]);
+         i++)
+    {
+        TFT_Comando(
+            configuracion[i].cmd,
+            configuracion[i].datos,
+            configuracion[i].cantidad
+        );
+    }
+
+    TFT_Comando(0x11, NULL, 0);
+    HAL_Delay(150);
+
+    TFT_Comando(0x29, NULL, 0);
+    HAL_Delay(50);
+
+    TFT_Estructura();
+    TFT_MostrarEspera();
+}
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+
+int main(void)
+{
+    HAL_Init();
+
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+    MX_SPI2_Init();
+    MX_SPI3_Init();
+    MX_USART1_UART_Init();
+    MX_USART2_UART_Init();
+
+    /* --------------------------------------------------------
+       FATFS
+       -------------------------------------------------------- */
+
+    MX_FATFS_Init();
+
+    /* --------------------------------------------------------
+       TFT
+       -------------------------------------------------------- */
+
+    TFT_Iniciar();
+
+    /* --------------------------------------------------------
+       UART1
+       -------------------------------------------------------- */
+
+    if (HAL_UART_Receive_IT(
+            &huart1,
+            &datoUART,
+            1
+        ) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* --------------------------------------------------------
+       UNICO MENSAJE DE INICIO
+       -------------------------------------------------------- */
+
+    UART_Texto(
+        &huart2,
+        "Esperando comandos...\r\n\r\n"
+    );
+
+    /* --------------------------------------------------------
+       CICLO PRINCIPAL
+       -------------------------------------------------------- */
+
+    while (1)
+    {
+        ProcesarUART();
+
+        /* ----------------------------------------------------
+           GUARDAR
+           ---------------------------------------------------- */
+
+        if (solicitudGuardado)
+        {
+            solicitudGuardado = 0U;
+
+            SD_GuardarTemperatura();
+        }
+
+        /* ----------------------------------------------------
+           MAQUINA DE ESTADOS
+           ---------------------------------------------------- */
+
+        switch (estado)
+        {
+            case REPOSO:
+
+                if (solicitudLectura)
+                {
+                    solicitudLectura = 0U;
+
+                    t0 = HAL_GetTick();
+
+                    DEBUG_Print(
+                        "[LM75 DEBUG] Iniciando medicion...\r\n"
+                    );
+
+                    estado = MIDIENDO;
+                }
+
+                break;
+
+            case MIDIENDO:
+
+                if ((HAL_GetTick() - t0) >=
+                    ESPERA_MEDICION)
+                {
+                    HAL_StatusTypeDef resultado =
+                        HAL_ERROR;
+
+                    if (!sensorPreparado)
+                    {
+                        sensorPreparado =
+                            (Sensor_Iniciar() == HAL_OK);
+                    }
+
+                    if (sensorPreparado)
+                    {
+                        resultado =
+                            Sensor_Temperatura(
+                                &temperatura
+                            );
+                    }
+
+                    if (resultado == HAL_OK)
+                    {
+                        char valor[20];
+                        char mensaje[64];
+
+                        ultimaTemperaturaValida =
+                            temperatura;
+
+                        medicionValida = 1U;
+
+                        FormatearTemperatura(
+                            valor,
+                            sizeof(valor),
+                            temperatura
+                        );
+
+                        DEBUG_Print(
+                            "[LM75 DEBUG] Temperatura valida: %s C\r\n",
+                            valor
+                        );
+
+                        snprintf(
+                            mensaje,
+                            sizeof(mensaje),
+                            "Temperatura: %s C\r\n",
+                            valor
+                        );
+
+                        UART_Responder(mensaje);
+
+                        TFT_MostrarValor(
+                            valor,
+                            temperatura
+                        );
+
+                        t0 = HAL_GetTick();
+
+                        if (temperatura >= UMBRAL_CALIENTE)
+                        {
+                            estado = ALERTA;
+                        }
+                        else
+                        {
+                            estado = ESTADO_OK;
+                        }
+                    }
+                    else
+                    {
+                        sensorPreparado = 0U;
+
+                        DEBUG_Print(
+                            "[LM75 DEBUG] Error: %s\r\n",
+                            motivoError
+                        );
+
+                        UART_Responder(
+                            "ERROR_SENSOR\r\n"
+                        );
+
+                        TFT_MostrarError();
+
+                        t0 = HAL_GetTick();
+
+                        estado = ERROR_I2C;
+                    }
+                }
+
+                break;
+
+            case ESTADO_OK:
+
+                if ((HAL_GetTick() - t0) >=
+                    DURACION_RESULTADO)
+                {
+                    if (temperatura < UMBRAL_FRIO)
+                    {
+                        DEBUG_Print(
+                            "[LM75 DEBUG] ESTADO FRIO\r\n"
+                        );
+                    }
+                    else
+                    {
+                        DEBUG_Print(
+                            "[LM75 DEBUG] ESTADO NORMAL\r\n"
+                        );
+                    }
+
+                    estado = REPOSO;
+                }
+
+                break;
+
+            case ALERTA:
+
+                if ((HAL_GetTick() - t0) >=
+                    DURACION_RESULTADO)
+                {
+                    DEBUG_Print(
+                        "[LM75 DEBUG] ESTADO CALIENTE\r\n"
+                    );
+
+                    estado = REPOSO;
+                }
+
+                break;
+
+            case ERROR_I2C:
+
+                if ((HAL_GetTick() - t0) >=
+                    DURACION_RESULTADO)
+                {
+                    estado = REPOSO;
+                }
+
+                break;
+
+            default:
+
+                estado = REPOSO;
+                break;
+        }
+    }
+}
+
+/* ============================================================
+   CALLBACK UART
+   ============================================================ */
+
+void HAL_UART_RxCpltCallback(
+    UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        uint16_t siguiente =
+            (escrituraUART + 1U) % TAM_COLA;
+
+        if (siguiente != lecturaUART)
+        {
+            colaUART[escrituraUART] =
+                datoUART;
+
+            escrituraUART = siguiente;
+        }
+        else
+        {
+            errorUART = 1U;
+        }
+
+        HAL_UART_Receive_IT(
+            &huart1,
+            &datoUART,
+            1
+        );
+    }
+}
+
+void HAL_UART_ErrorCallback(
+    UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        errorUART = 1U;
+
+        HAL_UART_Receive_IT(
+            &huart1,
+            &datoUART,
+            1
+        );
+    }
+}
+
+/* ============================================================
+   SYSTEM CLOCK
+   ============================================================ */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef osc = {0};
+    RCC_ClkInitTypeDef clk = {0};
+    RCC_PeriphCLKInitTypeDef per = {0};
+
+    osc.OscillatorType =
+        RCC_OSCILLATORTYPE_HSI;
+
+    osc.HSIState =
+        RCC_HSI_ON;
+
+    osc.HSICalibrationValue =
+        RCC_HSICALIBRATION_DEFAULT;
+
+    osc.PLL.PLLState =
+        RCC_PLL_ON;
+
+    osc.PLL.PLLSource =
+        RCC_PLLSOURCE_HSI;
+
+    osc.PLL.PLLMUL =
+        RCC_PLL_MUL16;
+
+    if (HAL_RCC_OscConfig(&osc) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    clk.ClockType =
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1 |
+        RCC_CLOCKTYPE_PCLK2;
+
+    clk.SYSCLKSource =
+        RCC_SYSCLKSOURCE_PLLCLK;
+
+    clk.AHBCLKDivider =
+        RCC_SYSCLK_DIV1;
+
+    clk.APB1CLKDivider =
+        RCC_HCLK_DIV2;
+
+    clk.APB2CLKDivider =
+        RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(
+            &clk,
+            FLASH_LATENCY_2
+        ) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    per.PeriphClockSelection =
+        RCC_PERIPHCLK_USART1 |
+        RCC_PERIPHCLK_I2C1;
+
+    per.Usart1ClockSelection =
+        RCC_USART1CLKSOURCE_PCLK1;
+
+    per.I2c1ClockSelection =
+        RCC_I2C1CLKSOURCE_HSI;
+
+    if (HAL_RCCEx_PeriphCLKConfig(
+            &per
+        ) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   I2C1 - LM75B
+   ============================================================ */
+
+static void MX_I2C1_Init(void)
+{
+    hi2c1.Instance = I2C1;
+
+    hi2c1.Init.Timing =
+        0x00201D2B;
+
+    hi2c1.Init.OwnAddress1 = 0;
+
+    hi2c1.Init.AddressingMode =
+        I2C_ADDRESSINGMODE_7BIT;
+
+    hi2c1.Init.DualAddressMode =
+        I2C_DUALADDRESS_DISABLE;
+
+    hi2c1.Init.OwnAddress2 = 0;
+
+    hi2c1.Init.OwnAddress2Masks =
+        I2C_OA2_NOMASK;
+
+    hi2c1.Init.GeneralCallMode =
+        I2C_GENERALCALL_DISABLE;
+
+    hi2c1.Init.NoStretchMode =
+        I2C_NOSTRETCH_DISABLE;
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    if (HAL_I2CEx_ConfigAnalogFilter(
+            &hi2c1,
+            I2C_ANALOGFILTER_ENABLE
+        ) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    if (HAL_I2CEx_ConfigDigitalFilter(
+            &hi2c1,
+            0
+        ) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   SPI2 - MICROSD
+   ============================================================ */
+
+static void MX_SPI2_Init(void)
+{
+    hspi2.Instance = SPI2;
+
+    hspi2.Init.Mode =
+        SPI_MODE_MASTER;
+
+    hspi2.Init.Direction =
+        SPI_DIRECTION_2LINES;
+
+    hspi2.Init.DataSize =
+        SPI_DATASIZE_8BIT;
+
+    hspi2.Init.CLKPolarity =
+        SPI_POLARITY_LOW;
+
+    hspi2.Init.CLKPhase =
+        SPI_PHASE_1EDGE;
+
+    hspi2.Init.NSS =
+        SPI_NSS_SOFT;
+
+    hspi2.Init.BaudRatePrescaler =
+        SPI_BAUDRATEPRESCALER_128;
+
+    hspi2.Init.FirstBit =
+        SPI_FIRSTBIT_MSB;
+
+    hspi2.Init.TIMode =
+        SPI_TIMODE_DISABLE;
+
+    hspi2.Init.CRCCalculation =
+        SPI_CRCCALCULATION_DISABLE;
+
+    hspi2.Init.CRCPolynomial = 7;
+
+    hspi2.Init.CRCLength =
+        SPI_CRC_LENGTH_DATASIZE;
+
+    hspi2.Init.NSSPMode =
+        SPI_NSS_PULSE_ENABLE;
+
+    if (HAL_SPI_Init(&hspi2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   SPI3 - PANTALLA
+   ============================================================ */
+
+static void MX_SPI3_Init(void)
+{
+    hspi3.Instance = SPI3;
+
+    hspi3.Init.Mode =
+        SPI_MODE_MASTER;
+
+    hspi3.Init.Direction =
+        SPI_DIRECTION_2LINES;
+
+    hspi3.Init.DataSize =
+        SPI_DATASIZE_8BIT;
+
+    hspi3.Init.CLKPolarity =
+        SPI_POLARITY_LOW;
+
+    hspi3.Init.CLKPhase =
+        SPI_PHASE_1EDGE;
+
+    hspi3.Init.NSS =
+        SPI_NSS_SOFT;
+
+    hspi3.Init.BaudRatePrescaler =
+        SPI_BAUDRATEPRESCALER_4;
+
+    hspi3.Init.FirstBit =
+        SPI_FIRSTBIT_MSB;
+
+    hspi3.Init.TIMode =
+        SPI_TIMODE_DISABLE;
+
+    hspi3.Init.CRCCalculation =
+        SPI_CRCCALCULATION_DISABLE;
+
+    hspi3.Init.CRCPolynomial = 7;
+
+    hspi3.Init.CRCLength =
+        SPI_CRC_LENGTH_DATASIZE;
+
+    hspi3.Init.NSSPMode =
+        SPI_NSS_PULSE_ENABLE;
+
+    if (HAL_SPI_Init(&hspi3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   USART1 - NUCLEO 1
+   ============================================================ */
+
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance = USART1;
+
+    huart1.Init.BaudRate = 115200;
+
+    huart1.Init.WordLength =
+        UART_WORDLENGTH_8B;
+
+    huart1.Init.StopBits =
+        UART_STOPBITS_1;
+
+    huart1.Init.Parity =
+        UART_PARITY_NONE;
+
+    huart1.Init.Mode =
+        UART_MODE_TX_RX;
+
+    huart1.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+
+    huart1.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+
+    huart1.Init.OneBitSampling =
+        UART_ONE_BIT_SAMPLE_DISABLE;
+
+    huart1.AdvancedInit.AdvFeatureInit =
+        UART_ADVFEATURE_NO_INIT;
+
+    if (HAL_UART_Init(&huart1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   USART2 - HERCULES
+   ============================================================ */
+
+static void MX_USART2_UART_Init(void)
+{
+    huart2.Instance = USART2;
+
+    huart2.Init.BaudRate = 38400;
+
+    huart2.Init.WordLength =
+        UART_WORDLENGTH_8B;
+
+    huart2.Init.StopBits =
+        UART_STOPBITS_1;
+
+    huart2.Init.Parity =
+        UART_PARITY_NONE;
+
+    huart2.Init.Mode =
+        UART_MODE_TX_RX;
+
+    huart2.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+
+    huart2.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+
+    huart2.Init.OneBitSampling =
+        UART_ONE_BIT_SAMPLE_DISABLE;
+
+    huart2.AdvancedInit.AdvFeatureInit =
+        UART_ADVFEATURE_NO_INIT;
+
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   GPIO
+   ============================================================ */
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOF_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    HAL_GPIO_WritePin(
+        TFT_CS_GPIO_Port,
+        TFT_CS_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_GPIO_WritePin(
+        GPIOA,
+        TFT_RST_Pin | TFT_DC_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_GPIO_WritePin(
+        SD_CS_GPIO_Port,
+        SD_CS_Pin,
+        GPIO_PIN_SET
+    );
+
+    /* Boton B1 */
+
+    GPIO_InitStruct.Pin =
+        B1_Pin;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_IT_FALLING;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    HAL_GPIO_Init(
+        B1_GPIO_Port,
+        &GPIO_InitStruct
+    );
+
+    /* TFT CS */
+
+    GPIO_InitStruct.Pin =
+        TFT_CS_Pin;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_OUTPUT_PP;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    GPIO_InitStruct.Speed =
+        GPIO_SPEED_FREQ_HIGH;
+
+    HAL_GPIO_Init(
+        TFT_CS_GPIO_Port,
+        &GPIO_InitStruct
+    );
+
+    /* TFT RST y DC */
+
+    GPIO_InitStruct.Pin =
+        TFT_RST_Pin | TFT_DC_Pin;
+
+    HAL_GPIO_Init(
+        GPIOA,
+        &GPIO_InitStruct
+    );
+
+    /* SD CS */
+
+    GPIO_InitStruct.Pin =
+        SD_CS_Pin;
+
+    HAL_GPIO_Init(
+        SD_CS_GPIO_Port,
+        &GPIO_InitStruct
+    );
+}
+
+/* ============================================================
+   ERROR HANDLER
+   ============================================================ */
+
+void Error_Handler(void)
+{
+    __disable_irq();
+
+    while (1)
+    {
+    }
+}
+
+#ifdef USE_FULL_ASSERT
+
+void assert_failed(
+    uint8_t *file,
+    uint32_t line)
+{
+    (void)file;
+    (void)line;
+}
+
+#endif
