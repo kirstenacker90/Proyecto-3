@@ -1,0 +1,1978 @@
+/* USER CODE BEGIN Header */
+/*
+ * PROYECTO 03 - NUCLEO 1
+ * STM32F302R8
+ *
+ * USART1: ESP32 - Bluetooth BLE
+ * USART2: Computadora - Hercules
+ * USART3: Nucleo 2
+ *
+ * NeoPixel WS2812B: PA8 - TIM1 CH1 DMA
+ * Buzzer: DAC canal 1 - PA4
+ *
+ * Comandos:
+ * LECTURA  - Solicitar temperatura
+ * GUARDADO - Guardar ultima temperatura en microSD
+ *
+ * Respuestas desde Nucleo 2:
+ * Temperatura: XX.XX C
+ * SD_OK
+ * SD_ERROR
+ * SD_SIN_DATOS
+ *
+ * Estados NeoPixel:
+ * Azul     - Espera
+ * Amarillo - Solicitud de lectura
+ * Morado   - Solicitud de guardado
+ * Verde    - Confirmacion correcta
+ * Rojo     - Error
+ *
+ * IMPORTANTE:
+ * USART1 y USART3 deben tener interrupciones
+ * globales habilitadas en CubeMX.
+ *
+ * Este codigo controla la Nucleo 1.
+ * La escritura fisica en microSD corresponde
+ * al firmware de Nucleo 2.
+ */
+/* USER CODE END Header */
+
+#include "main.h"
+
+/* USER CODE BEGIN Includes */
+#include <stdint.h>
+#include <string.h>
+/* USER CODE END Includes */
+
+/* USER CODE BEGIN PD */
+
+#define TAM_COLA             256U
+#define TAM_TEXTO             80U
+#define TAM_COLA_N2          256U
+#define TAM_RESPUESTA_N2      80U
+
+#define NEO_CANTIDAD           7U
+#define NEO_ACTIVOS            7U
+#define NEO_BITS_LED          24U
+#define NEO_INICIO             2U
+#define NEO_RESET            320U
+
+#define NEO_TAM_BUFFER \
+    (NEO_INICIO + NEO_CANTIDAD * NEO_BITS_LED + NEO_RESET)
+
+#define NEO_CERO               3U
+#define NEO_UNO                6U
+#define NEO_BRILLO           200U
+
+#define NEO_DURACION_ESTADO  500U
+
+#define PRUEBA_SONIDOS_INICIO  0U
+
+/* USER CODE END PD */
+
+/* ============================================================
+   PERIFERICOS
+   ============================================================ */
+
+DAC_HandleTypeDef hdac;
+
+TIM_HandleTypeDef htim1;
+DMA_HandleTypeDef hdma_tim1_ch1;
+
+UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
+
+/* USER CODE BEGIN PV */
+
+/* ============================================================
+   RECEPCION UART1 - ESP32
+   ============================================================ */
+
+static uint8_t datoUART;
+
+static uint8_t cola[TAM_COLA];
+
+static volatile uint16_t escritura = 0;
+static volatile uint16_t lectura = 0;
+
+static volatile uint8_t errorRecepcion = 0;
+
+static char texto[TAM_TEXTO];
+
+static uint16_t longitud = 0;
+static uint8_t descartar = 0;
+
+/* ============================================================
+   RECEPCION UART3 - NUCLEO 2
+   ============================================================ */
+
+static uint8_t datoUART3;
+
+static uint8_t colaN2[TAM_COLA_N2];
+
+static volatile uint16_t escrituraN2 = 0;
+static volatile uint16_t lecturaN2 = 0;
+
+static volatile uint8_t errorUART3 = 0;
+
+/* ============================================================
+   RESPUESTAS DE NUCLEO 2
+   ============================================================ */
+
+static char respuestaN2[TAM_RESPUESTA_N2];
+
+static uint8_t longitudRespuestaN2 = 0;
+
+/*
+ * eventoSD:
+ *
+ * 0 = Ningun resultado pendiente
+ * 1 = Guardado exitoso
+ * 2 = Error de guardado
+ * 3 = No existe medicion valida
+ */
+
+static uint8_t eventoSD = 0;
+
+static uint8_t guardadoPendiente = 0;
+
+/* ============================================================
+   NEOPIXEL
+   ============================================================ */
+
+static uint16_t neoBuffer[NEO_TAM_BUFFER];
+
+static volatile uint8_t neoTerminado = 0;
+static volatile uint8_t neoError = 0;
+
+static uint8_t neoRetornoPendiente = 0;
+static uint32_t neoInicioEstado = 0;
+
+/* USER CODE END PV */
+
+/* ============================================================
+   PROTOTIPOS CUBEMX
+   ============================================================ */
+
+void SystemClock_Config(void);
+
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+
+static void MX_DAC_Init(void);
+static void MX_TIM1_Init(void);
+
+static void MX_USART1_UART_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_USART3_UART_Init(void);
+
+/* USER CODE BEGIN PFP */
+
+static void UART_Texto(
+    UART_HandleTypeDef *uart,
+    const char *mensaje
+);
+
+static void ProcesarCaracter(uint8_t dato);
+
+static void ProcesarDatosNucleo2(void);
+
+static void ProcesarLineaNucleo2(
+    const char *linea
+);
+
+static void ProcesarEventoSD(void);
+
+static void NeoPixel_ConfigurarGPIO(void);
+
+static HAL_StatusTypeDef NeoPixel_Color(
+    uint8_t rojo,
+    uint8_t verde,
+    uint8_t azul
+);
+
+static void NeoPixel_Indicar(
+    uint8_t rojo,
+    uint8_t verde,
+    uint8_t azul
+);
+
+static void NeoPixel_ActualizarEstado(void);
+
+static void Audio_Iniciar(void);
+
+static void Audio_Esperar_us(uint32_t tiempo);
+
+static void Audio_Nota(
+    uint16_t frecuencia,
+    uint16_t duracion
+);
+
+static void Sonido_Bienvenida(void);
+static void Sonido_Enviando(void);
+static void Sonido_Error(void);
+static void Sonido_Exito(void);
+static void Sonido_Prueba(void);
+
+/* USER CODE END PFP */
+
+/* USER CODE BEGIN 0 */
+
+/* ============================================================
+   FUNCIONES UART
+   ============================================================ */
+
+static void UART_Texto(
+    UART_HandleTypeDef *uart,
+    const char *mensaje)
+{
+    HAL_UART_Transmit(
+        uart,
+        (uint8_t *)mensaje,
+        (uint16_t)strlen(mensaje),
+        1000
+    );
+}
+
+/* ============================================================
+   INICIALIZAR AUDIO DAC
+   ============================================================ */
+
+static void Audio_Iniciar(void)
+{
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+
+    DWT->CYCCNT = 0;
+
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) == 0U)
+    {
+        Error_Handler();
+    }
+
+    if (HAL_DAC_Start(
+            &hdac,
+            DAC_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    HAL_DAC_SetValue(
+        &hdac,
+        DAC_CHANNEL_1,
+        DAC_ALIGN_12B_R,
+        0
+    );
+}
+
+/* ============================================================
+   ESPERA EN MICROSEGUNDOS
+   ============================================================ */
+
+static void Audio_Esperar_us(uint32_t tiempo)
+{
+    uint32_t inicio = DWT->CYCCNT;
+
+    uint32_t ciclos =
+        tiempo * (SystemCoreClock / 1000000U);
+
+    while ((uint32_t)(DWT->CYCCNT - inicio) < ciclos)
+    {
+    }
+}
+
+/* ============================================================
+   GENERAR TONO CON DAC
+   ============================================================ */
+
+static void Audio_Nota(
+    uint16_t frecuencia,
+    uint16_t duracion)
+{
+    if (frecuencia == 0U)
+    {
+        HAL_DAC_SetValue(
+            &hdac,
+            DAC_CHANNEL_1,
+            DAC_ALIGN_12B_R,
+            0
+        );
+
+        HAL_Delay(duracion);
+        return;
+    }
+
+    uint32_t medioPeriodo =
+        500000U / frecuencia;
+
+    uint32_t repeticiones =
+        ((uint32_t)frecuencia * duracion) / 1000U;
+
+    for (uint32_t i = 0; i < repeticiones; i++)
+    {
+        HAL_DAC_SetValue(
+            &hdac,
+            DAC_CHANNEL_1,
+            DAC_ALIGN_12B_R,
+            4095
+        );
+
+        Audio_Esperar_us(medioPeriodo);
+
+        HAL_DAC_SetValue(
+            &hdac,
+            DAC_CHANNEL_1,
+            DAC_ALIGN_12B_R,
+            0
+        );
+
+        Audio_Esperar_us(medioPeriodo);
+    }
+
+    HAL_DAC_SetValue(
+        &hdac,
+        DAC_CHANNEL_1,
+        DAC_ALIGN_12B_R,
+        0
+    );
+
+    HAL_Delay(15);
+}
+
+/* ============================================================
+   SONIDO DE PRUEBA
+   ============================================================ */
+
+static void Sonido_Prueba(void)
+{
+    for (uint8_t i = 0; i < 3; i++)
+    {
+        HAL_GPIO_TogglePin(
+            LD2_GPIO_Port,
+            LD2_Pin
+        );
+
+        Audio_Nota(1000, 500);
+
+        HAL_Delay(300);
+    }
+
+    HAL_GPIO_WritePin(
+        LD2_GPIO_Port,
+        LD2_Pin,
+        GPIO_PIN_SET
+    );
+}
+
+/* ============================================================
+   SONIDO DE BIENVENIDA
+   ============================================================ */
+
+static void Sonido_Bienvenida(void)
+{
+    Audio_Nota(523, 180);
+    Audio_Nota(659, 180);
+    Audio_Nota(784, 180);
+    Audio_Nota(1047, 300);
+
+    Audio_Nota(0, 120);
+
+    Audio_Nota(587, 180);
+    Audio_Nota(740, 180);
+    Audio_Nota(880, 180);
+    Audio_Nota(1175, 300);
+
+    Audio_Nota(0, 120);
+
+    Audio_Nota(659, 180);
+    Audio_Nota(784, 180);
+    Audio_Nota(988, 180);
+    Audio_Nota(1319, 300);
+
+    Audio_Nota(0, 150);
+
+    Audio_Nota(1047, 220);
+    Audio_Nota(988, 220);
+    Audio_Nota(784, 250);
+    Audio_Nota(659, 250);
+    Audio_Nota(523, 450);
+}
+
+/* ============================================================
+   SONIDO DE ENVIO
+   ============================================================ */
+
+static void Sonido_Enviando(void)
+{
+    Audio_Nota(440, 65);
+    Audio_Nota(554, 65);
+    Audio_Nota(659, 65);
+    Audio_Nota(880, 100);
+}
+
+/* ============================================================
+   SONIDO DE ERROR
+   ============================================================ */
+
+static void Sonido_Error(void)
+{
+    Audio_Nota(659, 100);
+    Audio_Nota(523, 120);
+    Audio_Nota(392, 160);
+    Audio_Nota(262, 260);
+}
+
+/* ============================================================
+   SONIDO DE EXITO
+   ============================================================ */
+
+static void Sonido_Exito(void)
+{
+    Audio_Nota(523, 90);
+    Audio_Nota(659, 90);
+    Audio_Nota(784, 120);
+
+    Audio_Nota(0, 45);
+
+    Audio_Nota(988, 120);
+    Audio_Nota(1175, 150);
+    Audio_Nota(1047, 100);
+    Audio_Nota(1319, 330);
+}
+
+/* ============================================================
+   NEOPIXEL - CONFIGURAR PA8
+   ============================================================ */
+
+static void NeoPixel_ConfigurarGPIO(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitStruct.Pin = GPIO_PIN_8;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF6_TIM1;
+
+    HAL_GPIO_Init(
+        GPIOA,
+        &GPIO_InitStruct
+    );
+}
+
+/* ============================================================
+   NEOPIXEL - ENVIAR COLOR
+   ============================================================ */
+
+static HAL_StatusTypeDef NeoPixel_Color(
+    uint8_t rojo,
+    uint8_t verde,
+    uint8_t azul)
+{
+    memset(
+        neoBuffer,
+        0,
+        sizeof(neoBuffer)
+    );
+
+    uint32_t color =
+        ((uint32_t)verde << 16) |
+        ((uint32_t)rojo << 8) |
+        (uint32_t)azul;
+
+    uint16_t indice = NEO_INICIO;
+
+    for (uint16_t led = 0; led < NEO_CANTIDAD; led++)
+    {
+        uint32_t colorLED =
+            (led < NEO_ACTIVOS) ? color : 0U;
+
+        for (int bit = 23; bit >= 0; bit--)
+        {
+            neoBuffer[indice++] =
+                (colorLED & (1UL << bit))
+                ? NEO_UNO
+                : NEO_CERO;
+        }
+    }
+
+    neoTerminado = 0;
+    neoError = 0;
+
+    __HAL_TIM_SET_COMPARE(
+        &htim1,
+        TIM_CHANNEL_1,
+        0
+    );
+
+    __HAL_TIM_SET_COUNTER(
+        &htim1,
+        0
+    );
+
+    HAL_StatusTypeDef resultado =
+        HAL_TIM_PWM_Start_DMA(
+            &htim1,
+            TIM_CHANNEL_1,
+            (uint32_t *)neoBuffer,
+            NEO_TAM_BUFFER
+        );
+
+    if (resultado != HAL_OK)
+    {
+        return resultado;
+    }
+
+    uint32_t inicio = HAL_GetTick();
+
+    while (!neoTerminado)
+    {
+        if ((HAL_GetTick() - inicio) >= 20U)
+        {
+            HAL_TIM_PWM_Stop_DMA(
+                &htim1,
+                TIM_CHANNEL_1
+            );
+
+            __HAL_TIM_SET_COMPARE(
+                &htim1,
+                TIM_CHANNEL_1,
+                0
+            );
+
+            return HAL_TIMEOUT;
+        }
+    }
+
+    HAL_TIM_PWM_Stop_DMA(
+        &htim1,
+        TIM_CHANNEL_1
+    );
+
+    __HAL_TIM_SET_COMPARE(
+        &htim1,
+        TIM_CHANNEL_1,
+        0
+    );
+
+    return neoError ? HAL_ERROR : HAL_OK;
+}
+
+/* ============================================================
+   NEOPIXEL - INDICAR ESTADO TEMPORAL
+   ============================================================ */
+
+static void NeoPixel_Indicar(
+    uint8_t rojo,
+    uint8_t verde,
+    uint8_t azul)
+{
+    if (NeoPixel_Color(
+            rojo,
+            verde,
+            azul) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    neoInicioEstado = HAL_GetTick();
+    neoRetornoPendiente = 1;
+}
+
+/* ============================================================
+   NEOPIXEL - INDICAR GUARDADO EN PROCESO
+   ============================================================ */
+
+static void NeoPixel_Guardando(void)
+{
+    neoRetornoPendiente = 0;
+
+    if (NeoPixel_Color(
+            NEO_BRILLO,
+            0,
+            NEO_BRILLO) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   NEOPIXEL - REGRESAR A AZUL
+   ============================================================ */
+
+static void NeoPixel_ActualizarEstado(void)
+{
+    if (guardadoPendiente)
+    {
+        return;
+    }
+
+    if (neoRetornoPendiente &&
+        ((HAL_GetTick() - neoInicioEstado) >=
+         NEO_DURACION_ESTADO))
+    {
+        neoRetornoPendiente = 0;
+
+        if (NeoPixel_Color(
+                0,
+                0,
+                NEO_BRILLO) != HAL_OK)
+        {
+            Error_Handler();
+        }
+    }
+}
+
+/* ============================================================
+   PROCESAR COMANDOS RECIBIDOS DEL ESP32
+   ============================================================ */
+
+static void ProcesarCaracter(uint8_t dato)
+{
+    if (dato == '\r' || dato == '\n')
+    {
+        if (descartar)
+        {
+            descartar = 0;
+            longitud = 0;
+            return;
+        }
+
+        if (longitud == 0U)
+        {
+            return;
+        }
+
+        texto[longitud] = '\0';
+
+        UART_Texto(
+            &huart2,
+            "Recibido ESP32: "
+        );
+
+        UART_Texto(
+            &huart2,
+            texto
+        );
+
+        UART_Texto(
+            &huart2,
+            "\r\n"
+        );
+
+        /* =====================================
+           COMANDO DE PRUEBA
+           ===================================== */
+
+        if (strcmp(texto, "PRUEBA") == 0)
+        {
+            Sonido_Prueba();
+            Sonido_Bienvenida();
+
+            HAL_Delay(250);
+
+            Sonido_Enviando();
+
+            HAL_Delay(250);
+
+            Sonido_Error();
+
+            HAL_Delay(250);
+
+            Sonido_Exito();
+
+            longitud = 0;
+            return;
+        }
+
+        /* =====================================
+           PRUEBA DE EXITO
+           ===================================== */
+
+        if (strcmp(texto, "EXITO") == 0)
+        {
+            NeoPixel_Indicar(
+                0,
+                NEO_BRILLO,
+                0
+            );
+
+            Sonido_Exito();
+
+            longitud = 0;
+            return;
+        }
+
+        /* =====================================
+           PRUEBA DE ERROR
+           ===================================== */
+
+        if (strcmp(texto, "ERROR") == 0)
+        {
+            NeoPixel_Indicar(
+                NEO_BRILLO,
+                0,
+                0
+            );
+
+            Sonido_Error();
+
+            longitud = 0;
+            return;
+        }
+
+        /* =====================================
+           IDENTIFICAR COMANDO
+           ===================================== */
+
+        uint8_t esLectura =
+            (strcmp(texto, "LECTURA") == 0) ||
+            (strcmp(texto, "LEER") == 0) ||
+            (strcmp(texto, "L") == 0);
+
+        uint8_t esGuardado =
+            (strcmp(texto, "GUARDADO") == 0) ||
+            (strcmp(texto, "GUARDAR") == 0) ||
+            (strcmp(texto, "G") == 0);
+
+        if (!esLectura && !esGuardado)
+        {
+            UART_Texto(
+                &huart2,
+                "Comando no reconocido\r\n"
+            );
+
+            UART_Texto(
+                &huart1,
+                "COMANDO_INVALIDO\r\n"
+            );
+
+            NeoPixel_Indicar(
+                NEO_BRILLO,
+                0,
+                0
+            );
+
+            Sonido_Error();
+
+            longitud = 0;
+            return;
+        }
+
+        /* =====================================
+           VALIDAR GUARDADO EN PROCESO
+           ===================================== */
+
+        if (esGuardado && guardadoPendiente)
+        {
+            UART_Texto(
+                &huart2,
+                "Guardado anterior pendiente\r\n"
+            );
+
+            UART_Texto(
+                &huart1,
+                "SD_OCUPADA\r\n"
+            );
+
+            longitud = 0;
+            return;
+        }
+
+        /* =====================================
+           INDICADOR SEGUN COMANDO
+           ===================================== */
+
+        if (esGuardado)
+        {
+            /* Morado: almacenamiento */
+
+            NeoPixel_Guardando();
+
+            guardadoPendiente = 1;
+        }
+        else
+        {
+            /* Amarillo: lectura */
+
+            NeoPixel_Indicar(
+                NEO_BRILLO,
+                NEO_BRILLO,
+                0
+            );
+        }
+
+        /* =====================================
+           SONIDO DE ENVIO
+           ===================================== */
+
+        Sonido_Enviando();
+
+        /* =====================================
+           TRANSMITIR COMANDO A NUCLEO 2
+           ===================================== */
+
+        HAL_StatusTypeDef resultado =
+            HAL_UART_Transmit(
+                &huart3,
+                (uint8_t *)texto,
+                longitud,
+                1000
+            );
+
+        if (resultado == HAL_OK)
+        {
+            uint8_t finLinea = '\n';
+
+            resultado = HAL_UART_Transmit(
+                &huart3,
+                &finLinea,
+                1,
+                1000
+            );
+        }
+
+        longitud = 0;
+
+        /* =====================================
+           COMPROBAR ENVIO UART
+           ===================================== */
+
+        if (resultado == HAL_OK)
+        {
+            UART_Texto(
+                &huart2,
+                "UART3 enviado, esperando confirmacion\r\n"
+            );
+
+            /*
+             * Para LECTURA se conserva
+             * la indicacion de transmision.
+             *
+             * Para GUARDADO se mantiene
+             * morado hasta recibir SD_OK
+             * o una respuesta de error.
+             */
+
+            if (esLectura)
+            {
+                NeoPixel_Indicar(
+                    0,
+                    NEO_BRILLO,
+                    0
+                );
+            }
+        }
+        else
+        {
+            guardadoPendiente = 0;
+
+            NeoPixel_Indicar(
+                NEO_BRILLO,
+                0,
+                0
+            );
+
+            Sonido_Error();
+
+            UART_Texto(
+                &huart2,
+                "ERROR: No se pudo enviar por UART3\r\n"
+            );
+
+            UART_Texto(
+                &huart1,
+                "ERROR_UART3\r\n"
+            );
+        }
+
+        return;
+    }
+
+    /* =========================================
+       PROCESAR CARACTERES DEL COMANDO
+       ========================================= */
+
+    if (descartar)
+    {
+        return;
+    }
+
+    if (dato >= 'a' && dato <= 'z')
+    {
+        dato = (uint8_t)(dato - ('a' - 'A'));
+    }
+
+    if (dato >= 32U && dato <= 126U)
+    {
+        if (longitud < TAM_TEXTO - 1U)
+        {
+            texto[longitud++] = (char)dato;
+        }
+        else
+        {
+            longitud = 0;
+            descartar = 1;
+
+            NeoPixel_Indicar(
+                NEO_BRILLO,
+                0,
+                0
+            );
+
+            Sonido_Error();
+        }
+    }
+}
+
+/* ============================================================
+   PROCESAR LINEAS RECIBIDAS DESDE NUCLEO 2
+   ============================================================ */
+
+static void ProcesarLineaNucleo2(const char *linea)
+{
+    if (strcmp(linea, "SD_OK") == 0)
+    {
+        guardadoPendiente = 0;
+        eventoSD = 1;
+    }
+    else if (strcmp(linea, "SD_ERROR") == 0)
+    {
+        guardadoPendiente = 0;
+        eventoSD = 2;
+    }
+    else if (strcmp(linea, "SD_SIN_DATOS") == 0)
+    {
+        guardadoPendiente = 0;
+        eventoSD = 3;
+    }
+}
+
+/* ============================================================
+   RECIBIR Y REENVIAR RESPUESTAS DE NUCLEO 2
+   ============================================================ */
+
+static void ProcesarDatosNucleo2(void)
+{
+    uint8_t datos[64];
+    uint16_t cantidad = 0;
+
+    while ((lecturaN2 != escrituraN2) &&
+           (cantidad < sizeof(datos)))
+    {
+        uint8_t dato = colaN2[lecturaN2];
+
+        lecturaN2 =
+            (lecturaN2 + 1U) % TAM_COLA_N2;
+
+        datos[cantidad++] = dato;
+
+        /* =====================================
+           DETECTAR FINAL DE RESPUESTA
+           ===================================== */
+
+        if (dato == '\n')
+        {
+            respuestaN2[longitudRespuestaN2] = '\0';
+
+            ProcesarLineaNucleo2(respuestaN2);
+
+            longitudRespuestaN2 = 0;
+        }
+        else if (dato != '\r')
+        {
+            if (longitudRespuestaN2 <
+                TAM_RESPUESTA_N2 - 1U)
+            {
+                respuestaN2[longitudRespuestaN2++] =
+                    (char)dato;
+            }
+            else
+            {
+                longitudRespuestaN2 = 0;
+            }
+        }
+    }
+
+    if (cantidad > 0U)
+    {
+        /* =====================================
+           ENVIAR DATOS A HERCULES
+           ===================================== */
+
+        HAL_UART_Transmit(
+            &huart2,
+            datos,
+            cantidad,
+            1000
+        );
+
+        /* =====================================
+           ENVIAR DATOS AL ESP32
+           ===================================== */
+
+        HAL_UART_Transmit(
+            &huart1,
+            datos,
+            cantidad,
+            1000
+        );
+    }
+}
+
+/* ============================================================
+   PROCESAR RESULTADOS DE GUARDADO
+   ============================================================ */
+
+static void ProcesarEventoSD(void)
+{
+    uint8_t evento = eventoSD;
+
+    if (evento == 0U)
+    {
+        return;
+    }
+
+    eventoSD = 0;
+
+    /* =====================================
+       GUARDADO EXITOSO
+       ===================================== */
+
+    if (evento == 1U)
+    {
+        UART_Texto(
+            &huart2,
+            "Confirmacion: archivo SD guardado\r\n"
+        );
+
+        NeoPixel_Indicar(
+            0,
+            NEO_BRILLO,
+            0
+        );
+
+        Sonido_Exito();
+    }
+
+    /* =====================================
+       ERROR DE TARJETA SD
+       ===================================== */
+
+    else if (evento == 2U)
+    {
+        UART_Texto(
+            &huart2,
+            "Error: almacenamiento microSD\r\n"
+        );
+
+        NeoPixel_Indicar(
+            NEO_BRILLO,
+            0,
+            0
+        );
+
+        Sonido_Error();
+    }
+
+    /* =====================================
+       SIN MEDICIONES VALIDAS
+       ===================================== */
+
+    else if (evento == 3U)
+    {
+        UART_Texto(
+            &huart2,
+            "Error: primero realiza una lectura\r\n"
+        );
+
+        NeoPixel_Indicar(
+            NEO_BRILLO,
+            0,
+            0
+        );
+
+        Sonido_Error();
+    }
+}
+
+/* USER CODE END 0 */
+
+/* ============================================================
+   MAIN
+   ============================================================ */
+
+int main(void)
+{
+    /* USER CODE BEGIN 1 */
+    /* USER CODE END 1 */
+
+    HAL_Init();
+
+    /* USER CODE BEGIN Init */
+    /* USER CODE END Init */
+
+    SystemClock_Config();
+
+    /* USER CODE BEGIN SysInit */
+    /* USER CODE END SysInit */
+
+    /* ========================================================
+       INICIALIZAR PERIFERICOS UNA SOLA VEZ
+       ======================================================== */
+
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_DAC_Init();
+    MX_TIM1_Init();
+
+    MX_USART1_UART_Init();
+    MX_USART2_UART_Init();
+    MX_USART3_UART_Init();
+
+    /* USER CODE BEGIN 2 */
+
+    /* ========================================================
+       INICIALIZAR DAC
+       ======================================================== */
+
+    Audio_Iniciar();
+
+    HAL_GPIO_WritePin(
+        LD2_GPIO_Port,
+        LD2_Pin,
+        GPIO_PIN_SET
+    );
+
+    HAL_Delay(500);
+
+    /* ========================================================
+       SONIDOS DE INICIO
+       ======================================================== */
+
+#if PRUEBA_SONIDOS_INICIO
+
+    Sonido_Prueba();
+
+    HAL_Delay(400);
+
+    Sonido_Bienvenida();
+
+    HAL_Delay(300);
+
+    Sonido_Enviando();
+
+    HAL_Delay(300);
+
+    Sonido_Error();
+
+    HAL_Delay(300);
+
+    Sonido_Exito();
+
+#else
+
+    Sonido_Bienvenida();
+
+#endif
+
+    /* ========================================================
+       CONFIGURAR NEOPIXEL
+       ======================================================== */
+
+    NeoPixel_ConfigurarGPIO();
+
+    /* ========================================================
+       HABILITAR RECEPCION DESDE ESP32
+       ======================================================== */
+
+    if (HAL_UART_Receive_IT(
+            &huart1,
+            &datoUART,
+            1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* ========================================================
+       HABILITAR RECEPCION DESDE NUCLEO 2
+       ======================================================== */
+
+    if (HAL_UART_Receive_IT(
+            &huart3,
+            &datoUART3,
+            1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    HAL_Delay(2);
+
+    /* ========================================================
+       NEOPIXEL AZUL - ESPERA
+       ======================================================== */
+
+    if (NeoPixel_Color(
+            0,
+            0,
+            NEO_BRILLO) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /* ========================================================
+       MENSAJES DE INICIO
+       ======================================================== */
+
+    UART_Texto(
+        &huart2,
+        "\r\n================================\r\n"
+    );
+
+    UART_Texto(
+        &huart2,
+        "PROYECTO 03 - NUCLEO 1\r\n"
+    );
+
+    UART_Texto(
+        &huart2,
+        "================================\r\n"
+    );
+
+    UART_Texto(
+        &huart2,
+        "USART1: ESP32\r\n"
+    );
+
+    UART_Texto(
+        &huart2,
+        "USART2: Hercules\r\n"
+    );
+
+    UART_Texto(
+        &huart2,
+        "USART3: Nucleo 2\r\n"
+    );
+
+    UART_Texto(
+        &huart2,
+        "Comandos: LECTURA / GUARDADO\r\n"
+    );
+
+    UART_Texto(
+        &huart2,
+        "Esperando comandos...\r\n"
+    );
+
+    /* USER CODE END 2 */
+
+    /* USER CODE BEGIN WHILE */
+
+    while (1)
+    {
+        /* USER CODE END WHILE */
+
+        /* USER CODE BEGIN 3 */
+
+        /* ====================================================
+           VERIFICAR ERRORES DESDE ESP32
+           ==================================================== */
+
+        if (errorRecepcion)
+        {
+            errorRecepcion = 0;
+
+            longitud = 0;
+            descartar = 1;
+
+            NeoPixel_Indicar(
+                NEO_BRILLO,
+                0,
+                0
+            );
+
+            Sonido_Error();
+        }
+
+        /* ====================================================
+           VERIFICAR ERRORES DESDE NUCLEO 2
+           ==================================================== */
+
+        if (errorUART3)
+        {
+            errorUART3 = 0;
+
+            UART_Texto(
+                &huart2,
+                "ADVERTENCIA: Error UART3\r\n"
+            );
+        }
+
+        /* ====================================================
+           PROCESAR COMANDOS DEL ESP32
+           ==================================================== */
+
+        if (lectura != escritura)
+        {
+            uint8_t dato = cola[lectura];
+
+            lectura =
+                (lectura + 1U) % TAM_COLA;
+
+            ProcesarCaracter(dato);
+        }
+
+        /* ====================================================
+           PROCESAR RESPUESTAS DE NUCLEO 2
+           ==================================================== */
+
+        ProcesarDatosNucleo2();
+
+        /* ====================================================
+           ACTUALIZAR NEOPIXEL Y BUZZER SEGUN SD
+           ==================================================== */
+
+        ProcesarEventoSD();
+
+        /* ====================================================
+           REGRESAR NEOPIXEL A ESTADO DE ESPERA
+           ==================================================== */
+
+        NeoPixel_ActualizarEstado();
+
+        /* USER CODE END 3 */
+    }
+}
+
+/* ============================================================
+   SYSTEM CLOCK CONFIG
+   ============================================================ */
+
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+    RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+
+    RCC_OscInitStruct.OscillatorType =
+        RCC_OSCILLATORTYPE_HSI;
+
+    RCC_OscInitStruct.HSIState =
+        RCC_HSI_ON;
+
+    RCC_OscInitStruct.HSICalibrationValue =
+        RCC_HSICALIBRATION_DEFAULT;
+
+    RCC_OscInitStruct.PLL.PLLState =
+        RCC_PLL_NONE;
+
+    if (HAL_RCC_OscConfig(
+            &RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType =
+        RCC_CLOCKTYPE_HCLK |
+        RCC_CLOCKTYPE_SYSCLK |
+        RCC_CLOCKTYPE_PCLK1 |
+        RCC_CLOCKTYPE_PCLK2;
+
+    RCC_ClkInitStruct.SYSCLKSource =
+        RCC_SYSCLKSOURCE_HSI;
+
+    RCC_ClkInitStruct.AHBCLKDivider =
+        RCC_SYSCLK_DIV1;
+
+    RCC_ClkInitStruct.APB1CLKDivider =
+        RCC_HCLK_DIV1;
+
+    RCC_ClkInitStruct.APB2CLKDivider =
+        RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(
+            &RCC_ClkInitStruct,
+            FLASH_LATENCY_0) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    PeriphClkInit.PeriphClockSelection =
+        RCC_PERIPHCLK_USART1 |
+        RCC_PERIPHCLK_TIM1;
+
+    PeriphClkInit.Usart1ClockSelection =
+        RCC_USART1CLKSOURCE_PCLK1;
+
+    PeriphClkInit.Tim1ClockSelection =
+        RCC_TIM1CLK_HCLK;
+
+    if (HAL_RCCEx_PeriphCLKConfig(
+            &PeriphClkInit) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   DAC INIT
+   ============================================================ */
+
+static void MX_DAC_Init(void)
+{
+    DAC_ChannelConfTypeDef sConfig = {0};
+
+    hdac.Instance = DAC;
+
+    if (HAL_DAC_Init(&hdac) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    sConfig.DAC_Trigger =
+        DAC_TRIGGER_NONE;
+
+    sConfig.DAC_OutputBuffer =
+        DAC_OUTPUTBUFFER_ENABLE;
+
+    if (HAL_DAC_ConfigChannel(
+            &hdac,
+            &sConfig,
+            DAC_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   TIM1 INIT - NEOPIXEL
+   ============================================================ */
+
+static void MX_TIM1_Init(void)
+{
+    TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    TIM_OC_InitTypeDef sConfigOC = {0};
+
+    TIM_BreakDeadTimeConfigTypeDef
+        sBreakDeadTimeConfig = {0};
+
+    htim1.Instance = TIM1;
+
+    htim1.Init.Prescaler = 0;
+
+    htim1.Init.CounterMode =
+        TIM_COUNTERMODE_UP;
+
+    htim1.Init.Period = 9;
+
+    htim1.Init.ClockDivision =
+        TIM_CLOCKDIVISION_DIV1;
+
+    htim1.Init.RepetitionCounter = 0;
+
+    htim1.Init.AutoReloadPreload =
+        TIM_AUTORELOAD_PRELOAD_DISABLE;
+
+    if (HAL_TIM_Base_Init(&htim1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    sClockSourceConfig.ClockSource =
+        TIM_CLOCKSOURCE_INTERNAL;
+
+    if (HAL_TIM_ConfigClockSource(
+            &htim1,
+            &sClockSourceConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    sMasterConfig.MasterOutputTrigger =
+        TIM_TRGO_RESET;
+
+    sMasterConfig.MasterOutputTrigger2 =
+        TIM_TRGO2_RESET;
+
+    sMasterConfig.MasterSlaveMode =
+        TIM_MASTERSLAVEMODE_DISABLE;
+
+    if (HAL_TIMEx_MasterConfigSynchronization(
+            &htim1,
+            &sMasterConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    sConfigOC.OCMode =
+        TIM_OCMODE_PWM1;
+
+    sConfigOC.Pulse = 0;
+
+    sConfigOC.OCPolarity =
+        TIM_OCPOLARITY_HIGH;
+
+    sConfigOC.OCNPolarity =
+        TIM_OCNPOLARITY_HIGH;
+
+    sConfigOC.OCFastMode =
+        TIM_OCFAST_DISABLE;
+
+    sConfigOC.OCIdleState =
+        TIM_OCIDLESTATE_RESET;
+
+    sConfigOC.OCNIdleState =
+        TIM_OCNIDLESTATE_RESET;
+
+    if (HAL_TIM_PWM_ConfigChannel(
+            &htim1,
+            &sConfigOC,
+            TIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    __HAL_TIM_DISABLE_OCxPRELOAD(
+        &htim1,
+        TIM_CHANNEL_1
+    );
+
+    sBreakDeadTimeConfig.OffStateRunMode =
+        TIM_OSSR_DISABLE;
+
+    sBreakDeadTimeConfig.OffStateIDLEMode =
+        TIM_OSSI_DISABLE;
+
+    sBreakDeadTimeConfig.LockLevel =
+        TIM_LOCKLEVEL_OFF;
+
+    sBreakDeadTimeConfig.DeadTime = 0;
+
+    sBreakDeadTimeConfig.BreakState =
+        TIM_BREAK_DISABLE;
+
+    sBreakDeadTimeConfig.BreakPolarity =
+        TIM_BREAKPOLARITY_HIGH;
+
+    sBreakDeadTimeConfig.BreakFilter = 0;
+
+    sBreakDeadTimeConfig.Break2State =
+        TIM_BREAK2_DISABLE;
+
+    sBreakDeadTimeConfig.Break2Polarity =
+        TIM_BREAK2POLARITY_HIGH;
+
+    sBreakDeadTimeConfig.Break2Filter = 0;
+
+    sBreakDeadTimeConfig.AutomaticOutput =
+        TIM_AUTOMATICOUTPUT_DISABLE;
+
+    if (HAL_TIMEx_ConfigBreakDeadTime(
+            &htim1,
+            &sBreakDeadTimeConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    HAL_TIM_MspPostInit(&htim1);
+}
+
+/* ============================================================
+   USART1 - ESP32
+   ============================================================ */
+
+static void MX_USART1_UART_Init(void)
+{
+    huart1.Instance = USART1;
+
+    huart1.Init.BaudRate = 115200;
+
+    huart1.Init.WordLength =
+        UART_WORDLENGTH_8B;
+
+    huart1.Init.StopBits =
+        UART_STOPBITS_1;
+
+    huart1.Init.Parity =
+        UART_PARITY_NONE;
+
+    huart1.Init.Mode =
+        UART_MODE_TX_RX;
+
+    huart1.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+
+    huart1.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+
+    huart1.Init.OneBitSampling =
+        UART_ONE_BIT_SAMPLE_DISABLE;
+
+    huart1.AdvancedInit.AdvFeatureInit =
+        UART_ADVFEATURE_NO_INIT;
+
+    if (HAL_UART_Init(&huart1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   USART2 - HERCULES
+   ============================================================ */
+
+static void MX_USART2_UART_Init(void)
+{
+    huart2.Instance = USART2;
+
+    huart2.Init.BaudRate = 115200;
+
+    huart2.Init.WordLength =
+        UART_WORDLENGTH_8B;
+
+    huart2.Init.StopBits =
+        UART_STOPBITS_1;
+
+    huart2.Init.Parity =
+        UART_PARITY_NONE;
+
+    huart2.Init.Mode =
+        UART_MODE_TX_RX;
+
+    huart2.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+
+    huart2.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+
+    huart2.Init.OneBitSampling =
+        UART_ONE_BIT_SAMPLE_DISABLE;
+
+    huart2.AdvancedInit.AdvFeatureInit =
+        UART_ADVFEATURE_NO_INIT;
+
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   USART3 - NUCLEO 2
+   ============================================================ */
+
+static void MX_USART3_UART_Init(void)
+{
+    huart3.Instance = USART3;
+
+    huart3.Init.BaudRate = 115200;
+
+    huart3.Init.WordLength =
+        UART_WORDLENGTH_8B;
+
+    huart3.Init.StopBits =
+        UART_STOPBITS_1;
+
+    huart3.Init.Parity =
+        UART_PARITY_NONE;
+
+    huart3.Init.Mode =
+        UART_MODE_TX_RX;
+
+    huart3.Init.HwFlowCtl =
+        UART_HWCONTROL_NONE;
+
+    huart3.Init.OverSampling =
+        UART_OVERSAMPLING_16;
+
+    huart3.Init.OneBitSampling =
+        UART_ONE_BIT_SAMPLE_DISABLE;
+
+    huart3.AdvancedInit.AdvFeatureInit =
+        UART_ADVFEATURE_NO_INIT;
+
+    if (HAL_UART_Init(&huart3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+/* ============================================================
+   DMA INIT - NEOPIXEL
+   ============================================================ */
+
+static void MX_DMA_Init(void)
+{
+    __HAL_RCC_DMA1_CLK_ENABLE();
+
+    HAL_NVIC_SetPriority(
+        DMA1_Channel2_IRQn,
+        0,
+        0
+    );
+
+    HAL_NVIC_EnableIRQ(
+        DMA1_Channel2_IRQn
+    );
+}
+
+/* ============================================================
+   GPIO INIT
+   ============================================================ */
+
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOF_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+
+    HAL_GPIO_WritePin(
+        LD2_GPIO_Port,
+        LD2_Pin,
+        GPIO_PIN_RESET
+    );
+
+    /* Boton B1 */
+
+    GPIO_InitStruct.Pin = B1_Pin;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_IT_FALLING;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    HAL_GPIO_Init(
+        B1_GPIO_Port,
+        &GPIO_InitStruct
+    );
+
+    /* LED LD2 */
+
+    GPIO_InitStruct.Pin = LD2_Pin;
+
+    GPIO_InitStruct.Mode =
+        GPIO_MODE_OUTPUT_PP;
+
+    GPIO_InitStruct.Pull =
+        GPIO_NOPULL;
+
+    GPIO_InitStruct.Speed =
+        GPIO_SPEED_FREQ_LOW;
+
+    HAL_GPIO_Init(
+        LD2_GPIO_Port,
+        &GPIO_InitStruct
+    );
+}
+
+/* USER CODE BEGIN 4 */
+
+/* ============================================================
+   CALLBACK DE RECEPCION UART
+   ============================================================ */
+
+void HAL_UART_RxCpltCallback(
+    UART_HandleTypeDef *huart)
+{
+    /* ========================================================
+       RECEPCION ESP32 - USART1
+       ======================================================== */
+
+    if (huart->Instance == USART1)
+    {
+        uint16_t siguiente =
+            (escritura + 1U) % TAM_COLA;
+
+        if (siguiente != lectura)
+        {
+            cola[escritura] = datoUART;
+
+            escritura = siguiente;
+        }
+        else
+        {
+            errorRecepcion = 1;
+        }
+
+        HAL_UART_Receive_IT(
+            &huart1,
+            &datoUART,
+            1
+        );
+    }
+
+    /* ========================================================
+       RECEPCION NUCLEO 2 - USART3
+       ======================================================== */
+
+    else if (huart->Instance == USART3)
+    {
+        uint16_t siguiente =
+            (escrituraN2 + 1U) % TAM_COLA_N2;
+
+        if (siguiente != lecturaN2)
+        {
+            colaN2[escrituraN2] = datoUART3;
+
+            escrituraN2 = siguiente;
+        }
+        else
+        {
+            errorUART3 = 1;
+        }
+
+        HAL_UART_Receive_IT(
+            &huart3,
+            &datoUART3,
+            1
+        );
+    }
+}
+
+/* ============================================================
+   CALLBACK DE ERRORES UART
+   ============================================================ */
+
+void HAL_UART_ErrorCallback(
+    UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        errorRecepcion = 1;
+
+        HAL_UART_Receive_IT(
+            &huart1,
+            &datoUART,
+            1
+        );
+    }
+
+    else if (huart->Instance == USART3)
+    {
+        errorUART3 = 1;
+
+        HAL_UART_Receive_IT(
+            &huart3,
+            &datoUART3,
+            1
+        );
+    }
+}
+
+/* ============================================================
+   CALLBACK NEOPIXEL - DMA FINALIZADO
+   ============================================================ */
+
+void HAL_TIM_PWM_PulseFinishedCallback(
+    TIM_HandleTypeDef *htim)
+{
+    if ((htim->Instance == TIM1) &&
+        (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1))
+    {
+        __HAL_TIM_DISABLE_DMA(
+            htim,
+            TIM_DMA_CC1
+        );
+
+        __HAL_TIM_SET_COMPARE(
+            htim,
+            TIM_CHANNEL_1,
+            0
+        );
+
+        neoTerminado = 1;
+    }
+}
+
+/* ============================================================
+   CALLBACK NEOPIXEL - ERROR TIMER
+   ============================================================ */
+
+void HAL_TIM_ErrorCallback(
+    TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM1)
+    {
+        __HAL_TIM_DISABLE_DMA(
+            htim,
+            TIM_DMA_CC1
+        );
+
+        __HAL_TIM_SET_COMPARE(
+            htim,
+            TIM_CHANNEL_1,
+            0
+        );
+
+        neoError = 1;
+        neoTerminado = 1;
+    }
+}
+
+/* USER CODE END 4 */
+
+/* ============================================================
+   ERROR HANDLER
+   ============================================================ */
+
+void Error_Handler(void)
+{
+    __disable_irq();
+
+    while (1)
+    {
+    }
+}
+
+#ifdef USE_FULL_ASSERT
+
+void assert_failed(
+    uint8_t *file,
+    uint32_t line)
+{
+    (void)file;
+    (void)line;
+}
+
+#endif
+
+/*
+ * ============================================================
+ * REQUISITOS EXTERNOS DEL PROYECTO
+ * ============================================================
+ *
+ * En CubeMX de Nucleo 1:
+ *
+ * USART1 global interrupt: ENABLED
+ * USART3 global interrupt: ENABLED
+ *
+ * Los IRQHandler correspondientes deben llamar
+ * a HAL_UART_IRQHandler(&huart1) y
+ * HAL_UART_IRQHandler(&huart3), respectivamente.
+ *
+ * USART1: 115200 baudios
+ * USART2: 115200 baudios
+ * USART3: 115200 baudios
+ *
+ * El funcionamiento de SD_OK, SD_ERROR y
+ * SD_SIN_DATOS depende de que Nucleo 2
+ * implemente y transmita esos mensajes.
+ *
+ * No se requiere FatFs en Nucleo 1.
+ *
+ * ============================================================
+ */
